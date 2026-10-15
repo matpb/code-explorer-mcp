@@ -145,8 +145,9 @@ fn keygen_print_only_leaves_the_keys_file_alone() {
         .args(["keygen", "--name", "t", "--print-only"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("key: cex_"))
+        .stderr(predicate::str::contains("key: cex_"))
         .stdout(predicate::str::contains("[[key]]"))
+        .stdout(predicate::str::contains("key: cex_").not())
         .stderr(predicate::str::contains("will not be shown again"));
     assert_eq!(std::fs::read_to_string(&fx.keys).expect("keys"), "");
 }

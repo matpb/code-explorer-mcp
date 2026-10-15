@@ -1388,11 +1388,7 @@ async fn key_changes_apply_without_restart() {
         o.failed_attempts = "max_failures = 1000".into();
     }));
     let keys = Keys::get();
-    assert!(
-        keys.full_table.contains("disabled = false"),
-        "{}",
-        keys.full_table
-    );
+    assert!(!keys.full_table.contains("disabled"), "{}", keys.full_table);
     let http = reqwest::Client::new();
     let url = s.mcp_url();
     let full: &str = &keys.full;
@@ -1430,10 +1426,8 @@ async fn key_changes_apply_without_restart() {
     let write = |text: String| std::fs::write(&s.env.keys_file, text).expect("write keys");
 
     write(format!(
-        "{}\n\n{}\n",
-        keys.full_table
-            .replace("disabled = false", "disabled = true"),
-        keys.scoped_table
+        "{}\ndisabled = true\n\n{}\n",
+        keys.full_table, keys.scoped_table
     ));
     wait_status(full, 401, "disabled key").await;
     assert_eq!(status_of(scoped).await, 200);

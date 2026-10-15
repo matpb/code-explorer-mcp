@@ -275,16 +275,12 @@ impl Keys {
                 }
                 let out = cmd.output().expect("keygen");
                 assert!(out.status.success(), "keygen {name} failed");
-                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-                let key = stdout
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                let key = stderr
                     .lines()
                     .find_map(|l| l.strip_prefix("key: ").map(str::to_owned))
                     .expect("key line");
-                let table: String = stdout
-                    .lines()
-                    .filter(|l| !l.starts_with("key: "))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let table = String::from_utf8_lossy(&out.stdout).into_owned();
                 (key, table)
             };
             let (full, full_table) = mint("full", None);

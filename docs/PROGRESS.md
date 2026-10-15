@@ -32,11 +32,11 @@ Checklist for the v1 build. Kept current so a restart loses nothing. Spec: the o
 - [x] CLI: serve, check-config [--probe], keygen, scan --repo, status, healthcheck, askpass (hidden)
 
 ## Phase 4: integration tests
-- [ ] Fixture builder: local bare repos with known content, a planted fake secret, a symlink, a binary, a large file, denied paths
-- [ ] Every tool and every error code in the spec exercised over real MCP (streamable HTTP client)
-- [ ] Auth: 401, throttle 429, allow-list, revocation via reload
-- [ ] Puller: new commit swaps, failed fetch keeps serving, stale notice
-- [ ] Scan policies: redact masks, block holds, warn serves
+- [x] Fixture builder: local bare repos with known content, a planted fake secret, a symlink, a binary, a large file, denied paths
+- [x] Every tool and every error code in the spec exercised over real MCP (streamable HTTP client)
+- [x] Auth: 401, throttle 429, allow-list, revocation via reload
+- [x] Puller: new commit swaps, failed fetch keeps serving, stale notice
+- [x] Scan policies: redact masks, block holds, warn serves
 
 ## Phase 5: packaging
 - [x] Dockerfile (multi-stage, non-root, pinned gitleaks with checksum, healthcheck via binary)
@@ -45,8 +45,8 @@ Checklist for the v1 build. Kept current so a restart loses nothing. Spec: the o
 - [x] known_hosts for github.com and bitbucket.org
 
 ## Phase 6: docs and CI
-- [ ] README, CHANGELOG, LICENSE, SECURITY.md, config.example.toml, keys.example.toml
-- [ ] .github/workflows/ci.yml: fmt, clippy, test, docker build
+- [x] README, CHANGELOG, LICENSE, SECURITY.md, config.example.toml, keys.example.toml
+- [x] .github/workflows/ci.yml: fmt, clippy, test, docker build
 
 ## Phase 7: reviews
 - [ ] Correctness review (fresh subagent, diff + spec)

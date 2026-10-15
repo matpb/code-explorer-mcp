@@ -67,12 +67,13 @@ pub(super) fn run(
         eprintln!("cannot append to {}: {e}", keys_file.display());
         return EXIT_FAILURE;
     }
-    println!("key: {plaintext}");
     if print_only {
+        eprintln!("key: {plaintext}");
         eprintln!(
-            "This key will not be shown again. Add the [[key]] block above to the keys file."
+            "This key will not be shown again. Append the [[key]] block from stdout to the keys file."
         );
     } else {
+        println!("key: {plaintext}");
         eprintln!(
             "Added key {} ({name}) to {}. This key will not be shown again.",
             entry.id,
