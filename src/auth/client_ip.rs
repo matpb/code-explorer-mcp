@@ -2,7 +2,46 @@
 
 use http::HeaderMap;
 use ipnet::IpNet;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+const WARN_EVERY: Duration = Duration::from_secs(60);
+const WARN_TRACKED_MAX: usize = 1024;
+
+static LAST_WARN: Mutex<Option<HashMap<IpAddr, Instant>>> = Mutex::new(None);
+
+/// True when `peer` has not been warned about in the last minute; records the warning time.
+fn warn_due(map: &mut HashMap<IpAddr, Instant>, peer: IpAddr, now: Instant) -> bool {
+    if map.len() >= WARN_TRACKED_MAX {
+        map.retain(|_, t| now.saturating_duration_since(*t) < WARN_EVERY);
+    }
+    match map.get(&peer) {
+        Some(t) if now.saturating_duration_since(*t) < WARN_EVERY => false,
+        _ => {
+            if map.len() < WARN_TRACKED_MAX {
+                map.insert(peer, now);
+            }
+            true
+        }
+    }
+}
+
+fn warn_missing_header(peer: IpAddr, header: &str) {
+    let due = {
+        let mut guard = LAST_WARN.lock().unwrap_or_else(|p| p.into_inner());
+        warn_due(guard.get_or_insert_with(HashMap::new), peer, Instant::now())
+    };
+    if due {
+        tracing::warn!(
+            event = "proxy_without_client_address",
+            proxy = %peer,
+            header,
+            "trusted proxy sent no usable client address; the failed-attempt throttle keys on the proxy"
+        );
+    }
+}
 
 fn is_trusted(ip: IpAddr, trusted: &[IpNet]) -> bool {
     trusted.iter().any(|n| n.contains(&ip))
@@ -54,13 +93,19 @@ pub fn derive(
                 leftmost = Some(ip);
             }
         }
-        return leftmost.unwrap_or(peer);
+        return leftmost.unwrap_or_else(|| {
+            warn_missing_header(peer, name);
+            peer
+        });
     }
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_addr)
-        .unwrap_or(peer)
+        .unwrap_or_else(|| {
+            warn_missing_header(peer, name);
+            peer
+        })
 }
 
 #[cfg(test)]
@@ -220,5 +265,30 @@ mod tests {
             Some("x-forwarded-for"),
         );
         assert_eq!(got, ip("203.0.113.9"));
+    }
+
+    #[test]
+    fn missing_header_warning_is_rate_limited_per_peer() {
+        let mut map = HashMap::new();
+        let t0 = Instant::now();
+        let a = ip("10.0.0.1");
+        assert!(warn_due(&mut map, a, t0));
+        assert!(!warn_due(&mut map, a, t0 + Duration::from_secs(59)));
+        assert!(warn_due(
+            &mut map,
+            ip("10.0.0.2"),
+            t0 + Duration::from_secs(1)
+        ));
+        assert!(warn_due(&mut map, a, t0 + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn tracked_peers_are_bounded() {
+        let mut map = HashMap::new();
+        let t0 = Instant::now();
+        for i in 0..2000u32 {
+            warn_due(&mut map, IpAddr::from(i.to_be_bytes()), t0);
+        }
+        assert!(map.len() <= WARN_TRACKED_MAX);
     }
 }

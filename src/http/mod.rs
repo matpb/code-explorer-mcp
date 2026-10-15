@@ -1,5 +1,6 @@
 //! HTTP edge: public router (`/mcp`, `/healthz`), admin router (`/readyz`, `/metrics`) and the accept loop.
 
+mod idle;
 pub mod origin;
 pub mod readyz;
 
@@ -22,6 +23,7 @@ use rmcp::ServerHandler;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tower::Service;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -38,13 +40,35 @@ pub use readyz::{ReadyzBody, readyz};
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const H2_KEEP_ALIVE: Duration = Duration::from_secs(20);
+const MAX_CONNECTIONS: usize = 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Per-listener connection limits.
+#[derive(Debug, Clone, Copy)]
+pub struct ServeOptions {
+    pub header_read_timeout: Duration,
+    /// A connection with no bytes read or written for this long is closed.
+    pub idle_timeout: Duration,
+    /// Connections beyond this are accepted and closed at once.
+    pub max_connections: usize,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        ServeOptions {
+            header_read_timeout: HEADER_READ_TIMEOUT,
+            idle_timeout: IDLE_TIMEOUT,
+            max_connections: MAX_CONNECTIONS,
+        }
+    }
+}
 
 /// State of the public listener.
 pub struct PublicState {
     pub auth: Arc<AuthState>,
     pub allowed_origins: Vec<String>,
-    pub metrics: Arc<Metrics>,
 }
 
 /// State of the admin listener; `throttle` feeds the blocked-IP gauge.
@@ -196,19 +220,35 @@ async fn metrics_handler(State(st): State<Arc<AdminState>>) -> Response {
     resp
 }
 
-/// Accept loop with HTTP/1 and HTTP/2 auto detection; on cancel it stops accepting and drains for up to 10s.
+/// `serve_with` using the default connection limits.
 pub async fn serve(
     listener: TcpListener,
     router: Router,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
+    serve_with(listener, router, shutdown, ServeOptions::default()).await
+}
+
+/// Accept loop with HTTP/1 and HTTP/2 auto detection; on cancel it stops accepting and drains for up to 10s.
+pub async fn serve_with(
+    listener: TcpListener,
+    router: Router,
+    shutdown: CancellationToken,
+    options: ServeOptions,
+) -> std::io::Result<()> {
     let mut make_service = router.into_make_service_with_connect_info::<SocketAddr>();
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let slots = Arc::new(Semaphore::new(options.max_connections.max(1)));
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
         .http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_READ_TIMEOUT);
+        .header_read_timeout(options.header_read_timeout);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .keep_alive_interval(H2_KEEP_ALIVE)
+        .keep_alive_timeout(H2_KEEP_ALIVE);
     loop {
         let (stream, peer) = tokio::select! {
             _ = shutdown.cancelled() => break,
@@ -221,18 +261,25 @@ pub async fn serve(
                 }
             },
         };
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            tracing::debug!(peer = %peer, "connection cap reached, closing");
+            drop(stream);
+            continue;
+        };
         let service = match make_service.call(peer).await {
             Ok(s) => s,
             Err(never) => match never {},
         };
+        let io = TokioIo::new(idle::IdleStream::new(stream, options.idle_timeout));
         let conn = builder
             .clone()
-            .serve_connection_with_upgrades(TokioIo::new(stream), TowerToHyperService::new(service))
+            .serve_connection_with_upgrades(io, TowerToHyperService::new(service))
             .into_owned();
         let stop = shutdown.clone();
         let guard = done_tx.clone();
         tokio::spawn(async move {
             let _guard = guard;
+            let _slot = slot;
             let mut conn = std::pin::pin!(conn);
             let result = tokio::select! {
                 r = conn.as_mut() => r,

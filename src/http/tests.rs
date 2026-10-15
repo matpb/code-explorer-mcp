@@ -67,13 +67,14 @@ impl Fx {
         keys::append_entry(&path, &entry).expect("append");
         let store = KeyStore::new(path, cfg.repo.iter().map(|r| r.id.clone()).collect())
             .expect("key store");
-        let auth = Arc::new(AuthState {
-            keys: store.clone(),
-            throttle: Arc::new(Throttle::new(&FailedAttempts::default())),
-            trusted: vec![],
-            header: None,
-            metrics_hook: None,
-        });
+        let auth = Arc::new(AuthState::new(
+            store.clone(),
+            Arc::new(Throttle::new(&FailedAttempts::default())),
+            vec![],
+            None,
+            None,
+            4,
+        ));
         Fx {
             dir,
             cfg,
@@ -90,7 +91,6 @@ impl Fx {
             PublicState {
                 auth: self.auth.clone(),
                 allowed_origins: origins.iter().map(|s| s.to_string()).collect(),
-                metrics: self.metrics.clone(),
             },
         )
     }
@@ -439,4 +439,98 @@ async fn real_listener_serves_connect_info_and_shuts_down() {
         .expect("serve returns after cancel")
         .expect("join");
     assert!(done.is_ok());
+}
+
+async fn serve_with_options(options: ServeOptions) -> (SocketAddr, CancellationToken) {
+    let fx = Fx::new("");
+    let app = fx.public(&[]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let stop = CancellationToken::new();
+    tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            let _fx = fx;
+            let _ = serve_with(listener, app, stop, options).await;
+        }
+    });
+    (addr, stop)
+}
+
+async fn closed_within(stream: &mut tokio::net::TcpStream, limit: std::time::Duration) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0u8; 16];
+    match tokio::time::timeout(limit, stream.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => true,
+        Ok(Ok(_)) | Err(_) => false,
+    }
+}
+
+#[tokio::test]
+async fn silent_connection_is_closed_after_the_idle_timeout() {
+    let (addr, stop) = serve_with_options(ServeOptions {
+        idle_timeout: std::time::Duration::from_millis(300),
+        ..ServeOptions::default()
+    })
+    .await;
+    let mut silent = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    assert!(
+        closed_within(&mut silent, std::time::Duration::from_secs(5)).await,
+        "idle connection was not closed"
+    );
+
+    let client = reqwest::Client::new();
+    let r = client
+        .get(format!("http://{addr}/healthz"))
+        .send()
+        .await
+        .expect("a fresh connection still works");
+    assert_eq!(r.text().await.expect("text"), "ok");
+    stop.cancel();
+}
+
+#[tokio::test]
+async fn connection_over_the_cap_is_closed_and_a_freed_slot_is_reusable() {
+    let (addr, stop) = serve_with_options(ServeOptions {
+        max_connections: 2,
+        ..ServeOptions::default()
+    })
+    .await;
+    let held_a = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut held_b = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut over = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    assert!(
+        closed_within(&mut over, std::time::Duration::from_secs(5)).await,
+        "the third connection should be closed"
+    );
+    assert!(
+        !closed_within(&mut held_b, std::time::Duration::from_millis(300)).await,
+        "connections under the cap stay open"
+    );
+
+    drop(held_a);
+    let mut served = false;
+    for _ in 0..50 {
+        let mut s = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        if s.write_all(b"GET /healthz HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .is_ok()
+        {
+            let mut out = String::new();
+            let _ = s.read_to_string(&mut out).await;
+            if out.contains("200 OK") {
+                served = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        served,
+        "a slot freed by a closed connection must be reusable"
+    );
+    stop.cancel();
 }

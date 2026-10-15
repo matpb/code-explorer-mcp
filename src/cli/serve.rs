@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::{EXIT_FAILURE, EXIT_USAGE, git_runner, load_validated, print_problems};
-use crate::auth::{AuthEvent, AuthState, MetricsHook, Throttle};
+use crate::auth::{AuthState, MetricsHook, Throttle};
 use crate::config::LogFormat;
 use crate::http::{self, AdminState, PublicState};
 use crate::keys::KeyStore;
@@ -114,19 +114,19 @@ pub(super) async fn run(config_path: &Path, log_format: Option<LogFormat>) -> u8
     });
 
     let throttle = Arc::new(Throttle::new(&cfg.auth.failed_attempts));
-    let auth = Arc::new(AuthState {
-        keys: keys.clone(),
-        throttle: throttle.clone(),
-        trusted: cfg.server.trusted_proxies.clone(),
-        header: cfg.server.client_ip_header.clone(),
-        metrics_hook: Some(auth_hook(metrics.clone(), throttle.clone())),
-    });
+    let auth = Arc::new(AuthState::new(
+        keys.clone(),
+        throttle.clone(),
+        cfg.server.trusted_proxies.clone(),
+        cfg.server.client_ip_header.clone(),
+        Some(auth_hook(metrics.clone())),
+        cfg.auth.max_concurrent_verifications,
+    ));
     let public = http::public_router(
         explorer,
         PublicState {
             auth,
             allowed_origins: cfg.server.allowed_origins.clone(),
-            metrics: metrics.clone(),
         },
     );
     let admin = http::admin_router(AdminState {
@@ -137,8 +137,22 @@ pub(super) async fn run(config_path: &Path, log_format: Option<LogFormat>) -> u8
         started_at: Utc::now(),
         throttle: Some(throttle),
     });
-    let mut public_task = tokio::spawn(http::serve(public_listener, public, cancel.clone()));
-    let mut admin_task = tokio::spawn(http::serve(admin_listener, admin, cancel.clone()));
+    let options = http::ServeOptions {
+        max_connections: cfg.server.max_connections,
+        ..http::ServeOptions::default()
+    };
+    let mut public_task = tokio::spawn(http::serve_with(
+        public_listener,
+        public,
+        cancel.clone(),
+        options,
+    ));
+    let mut admin_task = tokio::spawn(http::serve_with(
+        admin_listener,
+        admin,
+        cancel.clone(),
+        options,
+    ));
 
     tracing::info!(
         event = "started",
@@ -192,15 +206,8 @@ fn report_listener_exit(name: &str, r: Result<std::io::Result<()>, tokio::task::
     }
 }
 
-fn auth_hook(metrics: Arc<Metrics>, throttle: Arc<Throttle>) -> MetricsHook {
-    Arc::new(move |event| {
-        match event {
-            AuthEvent::Failed { reason } => metrics.auth_failure(reason),
-            AuthEvent::Blocked => metrics.auth_failure("blocked"),
-            AuthEvent::Ok => return,
-        }
-        metrics.set_blocked_ips(throttle.blocked_count());
-    })
+fn auth_hook(metrics: Arc<Metrics>) -> MetricsHook {
+    Arc::new(move |event| metrics.record_auth_event(&event))
 }
 
 fn spawn_workers_gauge(

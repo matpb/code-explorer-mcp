@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::auth::AuthEvent;
 use prometheus::{
     Counter, CounterVec, Gauge, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
     exponential_buckets,
@@ -174,6 +175,16 @@ impl Metrics {
             .observe(bytes as f64);
     }
 
+    /// Counts failed, blocked and busy rejections; a successful authentication is not an event worth a series.
+    pub fn record_auth_event(&self, event: &AuthEvent) {
+        match event {
+            AuthEvent::Failed { reason } => self.auth_failure(reason),
+            AuthEvent::Blocked => self.auth_failure("blocked"),
+            AuthEvent::Busy => self.auth_failure("busy"),
+            AuthEvent::Ok => {}
+        }
+    }
+
     pub fn auth_failure(&self, reason: &str) {
         self.auth_failures.with_label_values(&[reason]).inc();
     }
@@ -302,5 +313,26 @@ mod tests {
         assert!(m.render().contains("explorer_repo_stale{repo=\"r\"} 1"));
         m.set_repo_stale("r", false);
         assert!(m.render().contains("explorer_repo_stale{repo=\"r\"} 0"));
+    }
+
+    #[test]
+    fn auth_events_map_to_reason_labels() {
+        let m = Metrics::new();
+        m.record_auth_event(&AuthEvent::Failed {
+            reason: "wrong_secret",
+        });
+        m.record_auth_event(&AuthEvent::Blocked);
+        m.record_auth_event(&AuthEvent::Busy);
+        m.record_auth_event(&AuthEvent::Ok);
+        let out = m.render();
+        for reason in ["wrong_secret", "blocked", "busy"] {
+            assert!(
+                out.contains(&format!(
+                    "explorer_auth_failures_total{{reason=\"{reason}\"}} 1"
+                )),
+                "{reason} in:\n{out}"
+            );
+        }
+        assert!(!out.contains("reason=\"ok\""));
     }
 }

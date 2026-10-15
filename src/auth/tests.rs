@@ -7,10 +7,12 @@ use axum::extract::Extension;
 use axum::routing::post;
 use http::Request as HttpRequest;
 use std::sync::Mutex;
+use std::time::Duration;
 use tower::ServiceExt;
 
 struct Harness {
     app: Router,
+    st: Arc<AuthState>,
     key: String,
     events: Arc<Mutex<Vec<AuthEvent>>>,
     _dir: tempfile::TempDir,
@@ -30,27 +32,36 @@ async fn whoami(
 }
 
 fn harness(trusted: &[&str], header: Option<&str>) -> Harness {
+    harness_with(trusted, header, 4, false)
+}
+
+fn harness_with(trusted: &[&str], header: Option<&str>, permits: usize, disabled: bool) -> Harness {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("keys.toml");
-    let (key, entry) = keys::keygen("alice", Some(vec!["repo-a".to_string()]), None);
+    let (key, mut entry) = keys::keygen("alice", Some(vec!["repo-a".to_string()]), None);
+    entry.disabled = disabled;
     keys::append_entry(&path, &entry).expect("append");
     let store = KeyStore::new(path, vec![]).expect("store");
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink = events.clone();
-    let st = Arc::new(AuthState {
-        keys: store,
-        throttle: Arc::new(Throttle::new(&FailedAttempts::default())),
-        trusted: trusted.iter().map(|s| s.parse().expect("net")).collect(),
-        header: header.map(str::to_string),
-        metrics_hook: Some(Arc::new(move |e| {
+    let mut state = AuthState::new(
+        store,
+        Arc::new(Throttle::new(&FailedAttempts::default())),
+        trusted.iter().map(|s| s.parse().expect("net")).collect(),
+        header.map(str::to_string),
+        Some(Arc::new(move |e| {
             sink.lock().expect("lock").push(e);
         })),
-    });
+        permits,
+    );
+    state.verify_wait = Duration::from_millis(100);
+    let st = Arc::new(state);
     let app = Router::new()
         .route("/mcp", post(whoami))
-        .layer(axum::middleware::from_fn_with_state(st, middleware));
+        .layer(axum::middleware::from_fn_with_state(st.clone(), middleware));
     Harness {
         app,
+        st,
         key,
         events,
         _dir: dir,
@@ -218,4 +229,86 @@ fn allows_respects_repo_scope() {
     assert!(!ctx.allows("b"));
     ctx.repos = None;
     assert!(ctx.allows("b"));
+}
+
+#[tokio::test]
+async fn busy_verifier_answers_503_without_counting_a_failure() {
+    let h = harness_with(&[], None, 1, false);
+    let _held =
+        h.st.verify_permits
+            .clone()
+            .try_acquire_owned()
+            .expect("permit");
+    let auth = format!("Bearer {}", bad_key(&h.key));
+    let (status, headers, body) = send(&h.app, "198.51.100.1", Some(&auth), None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers["retry-after"], "2");
+    assert_eq!(body, r#"{"error":"busy"}"#);
+    assert_eq!(h.st.throttle.len(), 0);
+    assert_eq!(*h.events.lock().expect("lock"), vec![AuthEvent::Busy]);
+}
+
+#[tokio::test]
+async fn waiting_request_gets_a_permit_released_in_time() {
+    let h = harness_with(&[], None, 1, false);
+    let held =
+        h.st.verify_permits
+            .clone()
+            .try_acquire_owned()
+            .expect("permit");
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(held);
+    });
+    let auth = format!("Bearer {}", h.key);
+    let (status, _, _) = send(&h.app, "198.51.100.1", Some(&auth), None).await;
+    assert_eq!(status, StatusCode::OK);
+    release.await.expect("join");
+}
+
+#[tokio::test]
+async fn cheap_failures_never_need_a_verifier_slot() {
+    let h = harness_with(&[], None, 1, true);
+    let _held =
+        h.st.verify_permits
+            .clone()
+            .try_acquire_owned()
+            .expect("permit");
+    let unknown = format!("Bearer cex_aaaaaaaa_{}", "A".repeat(43));
+    for auth in ["Bearer nonsense", unknown.as_str()] {
+        let (status, _, _) = send(&h.app, "198.51.100.1", Some(auth), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{auth}");
+    }
+    let disabled = format!("Bearer {}", h.key);
+    let (status, _, _) = send(&h.app, "198.51.100.1", Some(&disabled), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(h.st.throttle.len(), 1);
+    assert_eq!(
+        *h.events.lock().expect("lock"),
+        vec![
+            AuthEvent::Failed {
+                reason: "malformed"
+            },
+            AuthEvent::Failed {
+                reason: "unknown_id"
+            },
+            AuthEvent::Failed { reason: "disabled" },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn success_does_not_wipe_failures_inside_the_window() {
+    let h = harness(&[], None);
+    let good = format!("Bearer {}", h.key);
+    for _ in 0..4 {
+        let (status, _, _) = send(&h.app, "198.51.100.1", None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    let (status, _, _) = send(&h.app, "198.51.100.1", Some(&good), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = send(&h.app, "198.51.100.1", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, _) = send(&h.app, "198.51.100.1", Some(&good), None).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }

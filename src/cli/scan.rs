@@ -1,11 +1,11 @@
-//! `scan --repo <id>`: onboarding scan of a fresh clone, printing masked findings.
+//! `scan --repo <id>`: onboarding scan of a fresh clone through the serving scan path, printing masked findings.
 
 use std::path::Path;
 
 use super::{EXIT_FAILURE, EXIT_FINDINGS, EXIT_USAGE, git_runner, load_validated, print_problems};
 use crate::git;
-use crate::puller::ResolvedCreds;
-use crate::scan::{self, GitleaksScanner, Scanner};
+use crate::puller::{ResolvedCreds, prepare_scan_inputs};
+use crate::scan::{self, GitleaksScanner};
 
 pub(super) async fn run(config_path: &Path, repo_id: &str) -> u8 {
     let cfg = match load_validated(config_path) {
@@ -51,10 +51,6 @@ async fn scan_repo(
         .tempdir()
         .map_err(|e| e.to_string())?;
     let bare = tmp.path().join("git");
-    let worktree = tmp.path().join("worktree");
-    let messages_dir = tmp.path().join("messages");
-    std::fs::create_dir(&messages_dir).map_err(|e| e.to_string())?;
-
     git.clone_bare(&url, &repo.branch, depth, &bare, cred)
         .await
         .map_err(|e| e.to_string())?;
@@ -62,22 +58,24 @@ async fn scan_repo(
         .rev_parse(&bare, &format!("refs/heads/{}", repo.branch))
         .await
         .map_err(|e| e.to_string())?;
-    git.worktree_add(&bare, &tip, &worktree)
+    let inputs = prepare_scan_inputs(&git, &bare, &tip, depth, &tmp.path().join("worktree"))
         .await
         .map_err(|e| e.to_string())?;
-    let messages = git
-        .commit_messages(&bare, &tip, depth as usize)
-        .await
-        .map_err(|e| e.to_string())?;
-    let messages_file = messages_dir.join("commit_messages");
-    std::fs::write(&messages_file, messages).map_err(|e| e.to_string())?;
 
     let scanner = GitleaksScanner::new(cfg.scanner_bin(), cfg.scan.timeout);
-    let found = scanner
-        .scan_dir(&worktree, &[messages_file])
-        .await
-        .map_err(|e| e.to_string())?;
-    let findings = scan::apply_allowlist(found, &cfg.scan.allowlist);
+    let history = cfg
+        .features
+        .file_at_commit
+        .then_some((bare.as_path(), &tip));
+    let findings = scan::scan_snapshot(
+        &scanner,
+        &inputs.worktree,
+        &inputs.messages.file,
+        history,
+        &cfg.scan.allowlist,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     if findings.is_empty() {
         println!("repo {}: no findings at {}", repo.id, tip.short());

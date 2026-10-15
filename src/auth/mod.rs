@@ -3,7 +3,7 @@
 pub mod client_ip;
 pub mod throttle;
 
-use crate::keys::{AuthFailure, KeyStore};
+use crate::keys::{AuthFailure, KeyEntry, KeyStore, PendingVerify, Precheck};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
@@ -13,6 +13,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 pub use throttle::Throttle;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 /// Per-request identifier, also returned in the `x-request-id` response header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,7 @@ impl AuthContext {
 pub enum AuthEvent {
     Failed { reason: &'static str },
     Blocked,
+    Busy,
     Ok,
 }
 
@@ -64,9 +66,33 @@ pub struct AuthState {
     pub trusted: Vec<IpNet>,
     pub header: Option<String>,
     pub metrics_hook: Option<MetricsHook>,
+    pub verify_permits: Arc<Semaphore>,
+    pub verify_wait: Duration,
 }
 
+/// How long a request waits for an argon2 slot before getting 503.
+pub const VERIFY_WAIT: Duration = Duration::from_secs(2);
+
 impl AuthState {
+    pub fn new(
+        keys: Arc<KeyStore>,
+        throttle: Arc<Throttle>,
+        trusted: Vec<IpNet>,
+        header: Option<String>,
+        metrics_hook: Option<MetricsHook>,
+        max_concurrent_verifications: usize,
+    ) -> AuthState {
+        AuthState {
+            keys,
+            throttle,
+            trusted,
+            header,
+            metrics_hook,
+            verify_permits: Arc::new(Semaphore::new(max_concurrent_verifications.max(1))),
+            verify_wait: VERIFY_WAIT,
+        }
+    }
+
     fn emit(&self, ev: AuthEvent) {
         if let Some(h) = &self.metrics_hook {
             h(ev);
@@ -114,6 +140,106 @@ fn retry_after_secs(d: Duration) -> u64 {
     d.as_secs() + u64::from(d.subsec_nanos() > 0)
 }
 
+fn blocked_response(
+    st: &AuthState,
+    client_ip: IpAddr,
+    request_id: &str,
+    left: Duration,
+) -> Response {
+    tracing::warn!(event = "auth_blocked", client_ip = %client_ip, request_id = %request_id);
+    st.emit(AuthEvent::Blocked);
+    let mut resp = json_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":"too_many_failed_attempts"}"#,
+        request_id,
+    );
+    if let Ok(v) = HeaderValue::from_str(&retry_after_secs(left).max(1).to_string()) {
+        resp.headers_mut().insert(header::RETRY_AFTER, v);
+    }
+    resp
+}
+
+fn busy_response(st: &AuthState, client_ip: IpAddr, request_id: &str) -> Response {
+    tracing::warn!(event = "auth_busy", client_ip = %client_ip, request_id = %request_id);
+    st.emit(AuthEvent::Busy);
+    let mut resp = json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        r#"{"error":"busy"}"#,
+        request_id,
+    );
+    resp.headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
+    resp
+}
+
+fn unauthorized(
+    st: &AuthState,
+    client_ip: IpAddr,
+    request_id: &str,
+    reason: &'static str,
+) -> Response {
+    st.throttle.record_failure(client_ip, Instant::now());
+    tracing::warn!(event = "auth_failed", client_ip = %client_ip, reason, request_id = %request_id);
+    st.emit(AuthEvent::Failed { reason });
+    let mut resp = json_response(
+        StatusCode::UNAUTHORIZED,
+        r#"{"error":"unauthorized"}"#,
+        request_id,
+    );
+    resp.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static(r#"Bearer realm="code-explorer""#),
+    );
+    resp
+}
+
+/// Takes an argon2 slot at once if one is free, else waits up to `verify_wait`.
+async fn acquire_verify_permit(st: &AuthState) -> Option<OwnedSemaphorePermit> {
+    match st.verify_permits.clone().try_acquire_owned() {
+        Ok(p) => return Some(p),
+        Err(TryAcquireError::Closed) => return None,
+        Err(TryAcquireError::NoPermits) => {}
+    }
+    tokio::time::timeout(st.verify_wait, st.verify_permits.clone().acquire_owned())
+        .await
+        .ok()?
+        .ok()
+}
+
+enum Verified {
+    Entry(Arc<KeyEntry>),
+    Reject(Response),
+}
+
+/// Hashes on a blocking thread while holding `permit`, which stays held even if the request is dropped.
+async fn hash_verify(
+    st: &AuthState,
+    presented: String,
+    pending: PendingVerify,
+    permit: OwnedSemaphorePermit,
+    client_ip: IpAddr,
+    request_id: &str,
+) -> Verified {
+    let keys = st.keys.clone();
+    let joined = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        keys.complete(&presented, pending)
+    })
+    .await;
+    match joined {
+        Ok(Ok(entry)) => Verified::Entry(entry),
+        Ok(Err(f)) => Verified::Reject(unauthorized(st, client_ip, request_id, failure_reason(f))),
+        Err(err) => {
+            tracing::error!(error = %err, request_id = %request_id, "key verification task failed");
+            Verified::Reject(json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"internal_error"}"#,
+                request_id,
+            ))
+        }
+    }
+}
+
 /// Axum layer for `/mcp`: throttle check, key verification, then the inner service with an `AuthContext`.
 pub async fn middleware(
     State(st): State<Arc<AuthState>>,
@@ -125,63 +251,30 @@ pub async fn middleware(
     let request_id = new_request_id();
 
     if let Some(left) = st.throttle.check(client_ip, Instant::now()) {
-        tracing::warn!(event = "auth_blocked", client_ip = %client_ip, request_id = %request_id);
-        st.emit(AuthEvent::Blocked);
-        let mut resp = json_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            r#"{"error":"too_many_failed_attempts"}"#,
-            &request_id,
-        );
-        if let Ok(v) = HeaderValue::from_str(&retry_after_secs(left).max(1).to_string()) {
-            resp.headers_mut().insert(header::RETRY_AFTER, v);
-        }
-        return resp;
+        return blocked_response(&st, client_ip, &request_id, left);
     }
 
-    let outcome = match bearer(&req).map(str::to_owned) {
-        None => Err("missing"),
-        Some(presented) => {
-            let keys = st.keys.clone();
-            match tokio::task::spawn_blocking(move || keys.verify(&presented)).await {
-                Ok(Ok(entry)) => Ok(entry),
-                Ok(Err(f)) => Err(failure_reason(f)),
-                Err(err) => {
-                    tracing::error!(error = %err, request_id = %request_id, "key verification task failed");
-                    return json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        r#"{"error":"internal_error"}"#,
-                        &request_id,
-                    );
-                }
+    let Some(presented) = bearer(&req).map(str::to_owned) else {
+        return unauthorized(&st, client_ip, &request_id, "missing");
+    };
+    let entry = match st.keys.precheck(&presented) {
+        Err(f) => return unauthorized(&st, client_ip, &request_id, failure_reason(f)),
+        Ok(Precheck::Verified(entry)) => entry,
+        Ok(Precheck::NeedsHash(pending)) => {
+            let Some(permit) = acquire_verify_permit(&st).await else {
+                return busy_response(&st, client_ip, &request_id);
+            };
+            if let Some(left) = st.throttle.check(client_ip, Instant::now()) {
+                return blocked_response(&st, client_ip, &request_id, left);
+            }
+            match hash_verify(&st, presented, pending, permit, client_ip, &request_id).await {
+                Verified::Entry(entry) => entry,
+                Verified::Reject(resp) => return resp,
             }
         }
     };
 
-    let entry = match outcome {
-        Ok(entry) => entry,
-        Err(reason) => {
-            st.throttle.record_failure(client_ip, Instant::now());
-            tracing::warn!(
-                event = "auth_failed",
-                client_ip = %client_ip,
-                reason,
-                request_id = %request_id
-            );
-            st.emit(AuthEvent::Failed { reason });
-            let mut resp = json_response(
-                StatusCode::UNAUTHORIZED,
-                r#"{"error":"unauthorized"}"#,
-                &request_id,
-            );
-            resp.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                HeaderValue::from_static(r#"Bearer realm="code-explorer""#),
-            );
-            return resp;
-        }
-    };
-
-    st.throttle.record_success(client_ip);
+    st.throttle.record_success(client_ip, Instant::now());
     st.emit(AuthEvent::Ok);
     req.extensions_mut().insert(AuthContext {
         key_id: entry.id.clone(),

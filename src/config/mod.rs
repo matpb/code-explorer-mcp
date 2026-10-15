@@ -11,6 +11,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, de::Error as _};
 
 pub mod duration;
+mod recover;
 mod validate;
 
 pub use validate::{is_valid_branch, line_of};
@@ -160,6 +161,8 @@ pub struct Server {
     pub data_dir: PathBuf,
     pub git_path: Option<PathBuf>,
     pub rg_path: Option<PathBuf>,
+    /// Open connections per listener; extra connections are closed at once.
+    pub max_connections: usize,
 }
 
 impl Default for Server {
@@ -169,11 +172,12 @@ impl Default for Server {
             admin_listen: SocketAddr::from(([0, 0, 0, 0], 9090)),
             public_url: "https://explorer.example.com".into(),
             allowed_origins: Vec::new(),
-            trusted_proxies: vec!["172.30.0.0/24".parse().expect("static CIDR")],
+            trusted_proxies: Vec::new(),
             client_ip_header: Some("X-Forwarded-For".into()),
             data_dir: PathBuf::from("/data"),
             git_path: None,
             rg_path: None,
+            max_connections: 1024,
         }
     }
 }
@@ -183,6 +187,8 @@ impl Default for Server {
 pub struct Auth {
     pub keys_file: PathBuf,
     pub failed_attempts: FailedAttempts,
+    /// Argon2 key verifications allowed at once; more wait briefly, then get 503.
+    pub max_concurrent_verifications: usize,
 }
 
 impl Default for Auth {
@@ -190,6 +196,7 @@ impl Default for Auth {
         Auth {
             keys_file: PathBuf::from("/etc/code-explorer/keys.toml"),
             failed_attempts: FailedAttempts::default(),
+            max_concurrent_verifications: 4,
         }
     }
 }
@@ -501,8 +508,13 @@ impl Config {
 
     /// Deserialize only; no semantic or filesystem checks.
     pub fn parse_unvalidated(text: &str, file: &Path) -> Result<Config, Problems> {
-        let mut config: Config = toml::from_str(text)
-            .map_err(|e| Problems(vec![validate::toml_problem(&e, text, file)]))?;
+        let mut config: Config = toml::from_str(text).map_err(|e| {
+            Problems(recover::collect(
+                text,
+                file,
+                validate::toml_problem(&e, text, file),
+            ))
+        })?;
         config.source = file.to_path_buf();
         if config.server.client_ip_header.as_deref() == Some("") {
             config.server.client_ip_header = None;

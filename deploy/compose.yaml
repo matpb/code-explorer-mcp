@@ -41,13 +41,16 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
-    networks: [edge]
+    networks:
+      edge:
+        ipv4_address: ${CADDY_IP:-172.30.0.2}
     depends_on:
       - explorer
 
 networks:
   edge:
-    # Must match server.trusted_proxies in config.toml. Change both if it overlaps a network you already have.
+    # CADDY_IP must sit inside this subnet and match server.trusted_proxies in config.toml.
+    # Change both if the subnet overlaps a network you already have.
     ipam:
       config:
         - subnet: ${EDGE_SUBNET:-172.30.0.0/24}

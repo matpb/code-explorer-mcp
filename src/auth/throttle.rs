@@ -104,12 +104,20 @@ impl Throttle {
         }
     }
 
-    pub fn record_success(&self, ip: IpAddr) {
+    /// A success leaves failures inside the window alone; it only clears an entry whose block has expired.
+    pub fn record_success(&self, ip: IpAddr, now: Instant) {
         let key = self.key(ip);
-        lock(&self.cache).pop(&key);
+        let mut cache = lock(&self.cache);
+        let expired = cache
+            .peek(&key)
+            .and_then(|e| e.blocked_until)
+            .is_some_and(|until| until <= now);
+        if expired {
+            cache.pop(&key);
+        }
     }
 
-    /// Number of clients currently blocked.
+    /// Number of clients currently blocked. Scans every entry under the lock, so call it on scrape only.
     pub fn blocked_count(&self) -> usize {
         let now = Instant::now();
         lock(&self.cache)
@@ -242,16 +250,33 @@ mod tests {
     }
 
     #[test]
-    fn success_clears_the_entry() {
+    fn success_inside_the_window_keeps_the_failures() {
+        let t = Throttle::new(&cfg());
+        let a = ip("203.0.113.1");
+        let t0 = Instant::now();
+        fail(&t, a, t0, 4);
+        t.record_success(a, t0);
+        fail(&t, a, t0, 1);
+        assert_eq!(t.check(a, t0), Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn success_after_the_block_expires_resets_the_entry() {
         let t = Throttle::new(&cfg());
         let a = ip("203.0.113.1");
         let t0 = Instant::now();
         fail(&t, a, t0, 5);
-        assert!(t.check(a, t0).is_some());
-        t.record_success(a);
-        assert_eq!(t.check(a, t0), None);
-        assert_eq!(t.blocked_count(), 0);
-        fail(&t, a, t0, 4);
-        assert_eq!(t.check(a, t0), None);
+        t.record_success(a, t0);
+        assert!(
+            t.check(a, t0).is_some(),
+            "success cannot lift an active block"
+        );
+        let t1 = t0 + Duration::from_secs(3);
+        t.record_success(a, t1);
+        assert_eq!(t.len(), 0);
+        fail(&t, a, t1, 4);
+        assert_eq!(t.check(a, t1), None);
+        fail(&t, a, t1, 1);
+        assert_eq!(t.check(a, t1), Some(Duration::from_secs(2)));
     }
 }

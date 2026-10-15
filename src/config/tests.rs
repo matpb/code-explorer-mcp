@@ -156,13 +156,13 @@ fn unknown_field_reported_with_line() {
     let p = errs(load(&text));
     assert_eq!(p.len(), 1);
     assert!(p[0].fatal);
-    assert_eq!(p[0].key, "brnach");
+    assert_eq!(p[0].key, "repo[0].brnach");
     assert!(p[0].message.contains("unknown field"));
     assert_eq!(p[0].line, Some(line_in(&text, "brnach")));
     let shown = p[0].to_string();
     assert!(
         shown.starts_with(&format!(
-            "config.toml:{}: brnach: ",
+            "config.toml:{}: repo[0].brnach: ",
             line_in(&text, "brnach")
         )),
         "{shown}"
@@ -390,17 +390,17 @@ fn duplicate_host_path_branch_warns() {
 #[test]
 fn other_warnings() {
     let fx = Fx::new();
-    let text = fx
-        .valid()
-        .replace("description = \"d\"\n", "")
-        .replace("[server]\n", "[server]\ntrusted_proxies = []\n");
+    let text = fx.valid().replace("description = \"d\"\n", "").replace(
+        "[server]\n",
+        "[server]\ntrusted_proxies = []\nclient_ip_header = \"X-Forwarded-For\"\n",
+    );
     let loaded = load(&text).expect("warnings only");
     let keys: Vec<&str> = loaded.warnings.iter().map(|w| w.key.as_str()).collect();
     assert!(keys.contains(&"server.trusted_proxies"), "{keys:?}");
     assert!(keys.contains(&"repo[0].description"), "{keys:?}");
-    let cleared = text.replace(
-        "trusted_proxies = []\n",
-        "trusted_proxies = []\nclient_ip_header = \"\"\n",
+    let cleared = fx.valid().replace(
+        "[server]\n",
+        "[server]\ntrusted_proxies = []\nclient_ip_header = \"\"\n",
     );
     let loaded = load(&cleared).expect("ok");
     assert_eq!(loaded.config.server.client_ip_header, None);
@@ -410,6 +410,108 @@ fn other_warnings() {
             .iter()
             .any(|w| w.key == "server.trusted_proxies")
     );
+}
+
+#[test]
+fn default_config_has_no_trusted_proxy_and_no_warning() {
+    let fx = Fx::new();
+    let loaded = load(&fx.valid()).expect("valid");
+    assert!(loaded.config.server.trusted_proxies.is_empty());
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+}
+
+#[test]
+fn trusted_proxies_without_a_header_warns() {
+    let fx = Fx::new();
+    let text = fx.valid().replace(
+        "[server]\n",
+        "[server]\ntrusted_proxies = [\"172.30.0.2/32\"]\nclient_ip_header = \"\"\n",
+    );
+    let loaded = load(&text).expect("warnings only");
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.key == "server.client_ip_header" && !w.fatal),
+        "{:?}",
+        loaded.warnings
+    );
+}
+
+#[test]
+fn connection_and_verification_limits_are_validated() {
+    let fx = Fx::new();
+    let text = fx
+        .valid()
+        .replace("[server]\n", "[server]\nmax_connections = 8\n");
+    let p = errs(load(&text));
+    assert_eq!(p[0].key, "server.max_connections");
+    let text = fx
+        .valid()
+        .replace("[auth]\n", "[auth]\nmax_concurrent_verifications = 0\n");
+    let p = errs(load(&text));
+    assert_eq!(p[0].key, "auth.max_concurrent_verifications");
+    let loaded = load(&fx.valid()).expect("defaults");
+    assert_eq!(loaded.config.server.max_connections, 1024);
+    assert_eq!(loaded.config.auth.max_concurrent_verifications, 4);
+}
+
+#[test]
+fn type_errors_in_different_sections_are_all_reported() {
+    let fx = Fx::new();
+    let text = fx
+        .valid()
+        .replace(
+            "[server]\n",
+            "[server]\ntrusted_proxies = [\"10.0.0.0/99\"]\n",
+        )
+        .replace(
+            "[auth]\n",
+            "[auth]\n[auth.failed_attempts]\nwindow = \"soon\"\n",
+        )
+        + "brnach = \"x\"\n";
+    let p = errs(load(&text));
+    assert!(p.len() >= 3, "{p:?}");
+    let by_key = |k: &str| {
+        p.iter()
+            .find(|x| x.key == k)
+            .unwrap_or_else(|| panic!("{k} in {p:?}"))
+    };
+    let cidr = by_key("server.trusted_proxies");
+    assert!(cidr.message.contains("invalid CIDR"), "{}", cidr.message);
+    assert_eq!(cidr.line, Some(line_in(&text, "trusted_proxies")));
+    let dur = by_key("auth.failed_attempts.window");
+    assert!(dur.message.contains("invalid duration"), "{}", dur.message);
+    assert_eq!(dur.line, Some(line_in(&text, "window")));
+    let typo = by_key("repo[0].brnach");
+    assert_eq!(typo.line, Some(line_in(&text, "brnach")));
+}
+
+#[test]
+fn bad_repo_and_credential_entries_each_get_a_problem() {
+    let fx = Fx::new();
+    let text = format!(
+        "{}[credentials.d]\ntype = \"nope\"\n{}{}",
+        fx.head(),
+        fx.repo("pull_interval = \"whenever\"\n"),
+        fx.repo("")
+            .replace("id = \"a\"", "id = \"b\"")
+            .replace("host = \"github\"", "host = \"gitlab\"")
+    );
+    let p = errs(load(&text));
+    let keys: Vec<&str> = p.iter().map(|x| x.key.as_str()).collect();
+    for k in ["credentials.d", "repo[0].pull_interval", "repo[1].host"] {
+        assert!(keys.contains(&k), "{k} in {keys:?}");
+    }
+}
+
+#[test]
+fn missing_required_sections_are_listed_together() {
+    let p = errs(load("version = 1\n"));
+    let keys: Vec<&str> = p.iter().map(|x| x.key.as_str()).collect();
+    for k in ["server", "auth", "repo"] {
+        assert!(keys.contains(&k), "{k} in {keys:?}");
+    }
 }
 
 #[test]

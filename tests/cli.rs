@@ -91,7 +91,7 @@ fn check_config_reports_a_typo_with_its_line() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains(
-            "config.toml:3: listn: unknown field",
+            "config.toml:3: server.listn: unknown field",
         ))
         .stdout(predicate::str::contains("config has 1 problem(s)"));
 }

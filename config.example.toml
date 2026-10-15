@@ -6,14 +6,17 @@ listen        = "0.0.0.0:8080"               # public listener: /mcp and /health
 admin_listen  = "0.0.0.0:9090"               # /readyz and /metrics; do not publish this port
 public_url    = "https://explorer.example.com"
 allowed_origins = []                         # browser origins allowed; a present Origin not listed gets 403
-trusted_proxies = ["172.30.0.0/24"]          # only these peers may set the client IP header
+# Caddy's address on the compose network (CADDY_IP). Gateway mode: your gateway's egress addresses.
+trusted_proxies = ["172.30.0.2/32"]          # only these peers may set the client IP header
 client_ip_header = "X-Forwarded-For"         # or a single-value header your gateway sets; "" ignores client IP headers
+max_connections = 1024                       # open connections per listener; extra ones are closed at once (minimum 16)
 data_dir      = "/data"
 # git_path = "/usr/bin/git"                  # optional overrides when the binaries are not on PATH
 # rg_path  = "/usr/bin/rg"
 
 [auth]
 keys_file = "/etc/code-explorer/keys.toml"   # watched; reloaded on change or SIGHUP
+max_concurrent_verifications = 4             # argon2 checks at once (19 MiB each); extra requests wait 2s, then get 503
 
 [auth.failed_attempts]                       # per client IP; authenticated traffic is never rate limited
 max_failures = 5

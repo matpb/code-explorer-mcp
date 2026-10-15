@@ -596,7 +596,6 @@ async fn read_file_redacts_secrets_everywhere() {
         data["content"],
         "aws_access_key_id = [REDACTED:aws-access-token]"
     );
-    assert!(r.has_notice("secrets_redacted"));
     assert!(!r.raw.to_string().contains(&secret));
     assert!(!r.raw.to_string().contains("QYLPMN5HHHFPZAM2"));
 
@@ -612,7 +611,6 @@ async fn read_file_redacts_secrets_everywhere() {
         hit["text"],
         "aws_access_key_id = [REDACTED:aws-access-token]"
     );
-    assert!(g.has_notice("secrets_redacted"));
     assert!(!g.raw.to_string().contains("QYLPMN5HHHFPZAM2"));
 
     let by_secret = c

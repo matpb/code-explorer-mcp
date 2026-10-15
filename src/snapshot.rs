@@ -1,7 +1,8 @@
 //! In-memory file index, immutable snapshots, per-repo pull state and the on-disk state file.
 
-use std::collections::BTreeMap;
-use std::io::Write;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -68,6 +69,8 @@ impl IndexChild {
 pub struct FileIndex {
     entries: BTreeMap<RepoPath, TreeEntry>,
     dirs: BTreeMap<RepoPath, Vec<IndexChild>>,
+    utf16: BTreeSet<RepoPath>,
+    redacted: BTreeSet<RepoPath>,
 }
 
 impl FileIndex {
@@ -128,7 +131,54 @@ impl FileIndex {
                 key(a).cmp(&key(b))
             });
         }
-        FileIndex { entries, dirs }
+        FileIndex {
+            entries,
+            dirs,
+            utf16: BTreeSet::new(),
+            redacted: BTreeSet::new(),
+        }
+    }
+
+    /// Updates the size of an entry and of its listing under its parent directory.
+    pub fn set_size(&mut self, path: &RepoPath, size: u64) {
+        let Some(entry) = self.entries.get_mut(path) else {
+            return;
+        };
+        entry.size = size;
+        let listed = entry.kind != EntryKind::Submodule;
+        let parent = path.parent().unwrap_or_else(RepoPath::root);
+        if let Some(child) = self
+            .dirs
+            .get_mut(&parent)
+            .and_then(|list| list.iter_mut().find(|c| &c.path == path))
+        {
+            child.size = listed.then_some(size);
+        }
+    }
+
+    /// True when the worktree file starts with a UTF-16 byte order mark (set by `redact_at_rest`).
+    pub fn is_utf16(&self, path: &RepoPath) -> bool {
+        self.utf16.contains(path)
+    }
+
+    fn mark_utf16(&mut self, path: &RepoPath) {
+        self.utf16.insert(path.clone());
+    }
+
+    /// True when the worktree file had secrets replaced on disk, so its content carries redaction markers.
+    pub fn is_redacted(&self, path: &RepoPath) -> bool {
+        self.redacted.contains(path)
+    }
+
+    /// Marks an indexed file as rewritten by the redaction pass; unknown paths are ignored.
+    pub fn mark_redacted(&mut self, path: &RepoPath) {
+        if self.entries.contains_key(path) {
+            self.redacted.insert(path.clone());
+        }
+    }
+
+    pub fn redacted_paths(&self) -> impl Iterator<Item = &RepoPath> {
+        self.redacted.iter()
     }
 
     pub fn get(&self, path: &RepoPath) -> Option<&TreeEntry> {
@@ -196,6 +246,83 @@ impl FileIndex {
     }
 }
 
+const SNIFF_BYTES: usize = 8 * 1024;
+
+fn has_utf16_bom(head: &[u8]) -> bool {
+    head.starts_with(&[0xFF, 0xFE]) || head.starts_with(&[0xFE, 0xFF])
+}
+
+fn open_no_follow(path: &Path, write: bool) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(!write)
+        .write(write)
+        .truncate(write)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Replaces `redactor`'s patterns in place in every indexed worktree file except oversize and binary
+/// ones, syncs index sizes with the files on disk, marks UTF-16 files, and returns the files changed.
+pub fn redact_at_rest(
+    root: &Path,
+    index: &mut FileIndex,
+    redactor: &Redactor,
+    max_file_bytes: u64,
+) -> std::io::Result<usize> {
+    let paths: Vec<RepoPath> = index
+        .iter()
+        .filter(|e| e.kind != EntryKind::Submodule)
+        .map(|e| e.path.clone())
+        .collect();
+    let mut rewritten = 0;
+    for path in paths {
+        let full = root.join(path.as_str());
+        let mut file = match open_no_follow(&full, false) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::debug!(error = %e, "worktree file not readable, skipped by the redaction pass");
+                continue;
+            }
+        };
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            continue;
+        }
+        if index.get(&path).is_some_and(|e| e.size != meta.len()) {
+            index.set_size(&path, meta.len());
+        }
+        if meta.len() > max_file_bytes {
+            continue;
+        }
+        let mut head = [0u8; 2];
+        let got = file.read(&mut head)?;
+        if has_utf16_bom(&head[..got]) {
+            index.mark_utf16(&path);
+            continue;
+        }
+        if redactor.is_empty() {
+            continue;
+        }
+        let mut body = head[..got].to_vec();
+        file.read_to_end(&mut body)?;
+        drop(file);
+        if body[..body.len().min(SNIFF_BYTES)].contains(&0) {
+            continue;
+        }
+        let Some(clean) = redactor.redact_bytes(&body) else {
+            continue;
+        };
+        // The worktree is a detached checkout that is never committed or pushed, so a dirty status is fine.
+        let mut out = open_no_follow(&full, true)?;
+        out.write_all(&clean)?;
+        out.sync_all()?;
+        index.set_size(&path, clean.len() as u64);
+        index.mark_redacted(&path);
+        rewritten += 1;
+    }
+    Ok(rewritten)
+}
+
 /// Edit distance between `a` and `b`, or `None` when it exceeds `max`.
 fn levenshtein_within(a: &[u8], b: &[u8], max: usize) -> Option<usize> {
     if a.len().abs_diff(b.len()) > max {
@@ -231,6 +358,8 @@ pub struct Snapshot {
     pub redactor: Arc<Redactor>,
     pub findings: usize,
     pub pulled_at: DateTime<Utc>,
+    /// Worktree files whose secrets were replaced on disk by `redact_at_rest`.
+    pub rewritten_files: usize,
     pub remove_on_drop: AtomicBool,
 }
 
@@ -255,8 +384,14 @@ impl Snapshot {
             redactor,
             findings,
             pulled_at,
+            rewritten_files: 0,
             remove_on_drop: AtomicBool::new(false),
         }
+    }
+
+    pub fn with_rewritten_files(mut self, count: usize) -> Snapshot {
+        self.rewritten_files = count;
+        self
     }
 
     /// The worktree directory is deleted when the last `Arc<Snapshot>` goes away.
@@ -339,6 +474,8 @@ pub struct PullStatus {
     pub last_error: Option<PullError>,
     pub consecutive_failures: u32,
     pub scan_held: bool,
+    /// The tip the block policy refused; an unchanged tip is not rebuilt or rescanned.
+    pub held_commit: Option<Oid>,
     pub scan_findings: usize,
     pub initializing: bool,
     pub clone_started: Option<DateTime<Utc>>,
@@ -352,6 +489,7 @@ impl Default for PullStatus {
             last_error: None,
             consecutive_failures: 0,
             scan_held: false,
+            held_commit: None,
             scan_findings: 0,
             initializing: true,
             clone_started: None,
@@ -426,20 +564,23 @@ impl RepoState {
                 RepoStatus::Unavailable
             };
         }
+        if st.scan_held {
+            return RepoStatus::Stale;
+        }
         match self.last_success_or_pulled(&st) {
             Some(last) if age(last, now) > stale_after => RepoStatus::Stale,
             _ => RepoStatus::Ready,
         }
     }
 
-    /// Seconds since the last successful pull when stale, else 0.
+    /// Seconds since the last successful pull when stale (or held by the scan policy), else 0.
     pub fn stale_seconds(&self, stale_after: Duration, now: DateTime<Utc>) -> u64 {
         let st = self.lock();
         if self.current.load().is_none() {
             return 0;
         }
         match self.last_success_or_pulled(&st) {
-            Some(last) if age(last, now) > stale_after => age(last, now).as_secs(),
+            Some(last) if st.scan_held || age(last, now) > stale_after => age(last, now).as_secs(),
             _ => 0,
         }
     }
@@ -469,6 +610,7 @@ impl RepoState {
         st.last_error = None;
         st.consecutive_failures = 0;
         st.scan_held = false;
+        st.held_commit = None;
         st.initializing = false;
     }
 
@@ -492,6 +634,17 @@ impl RepoState {
         let mut st = self.lock();
         st.scan_findings = findings;
         st.scan_held = held;
+        if !held {
+            st.held_commit = None;
+        }
+    }
+
+    /// The block policy refused `commit`; later pulls of the same tip skip the rebuild.
+    pub fn record_hold(&self, findings: usize, commit: Oid) {
+        let mut st = self.lock();
+        st.scan_findings = findings;
+        st.scan_held = true;
+        st.held_commit = Some(commit);
     }
 }
 
@@ -534,60 +687,61 @@ impl Registry {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A finding as `state.json` keeps it: never the secret value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoredFinding {
     pub rule_id: String,
-    pub secret: String,
     pub fingerprint: String,
-}
-
-impl std::fmt::Debug for StoredFinding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StoredFinding")
-            .field("rule_id", &self.rule_id)
-            .field("fingerprint", &self.fingerprint)
-            .finish_non_exhaustive()
-    }
 }
 
 impl From<&Finding> for StoredFinding {
     fn from(f: &Finding) -> Self {
         StoredFinding {
             rule_id: f.rule_id.clone(),
-            secret: f.secret.clone(),
             fingerprint: f.fingerprint.clone(),
         }
     }
 }
 
-impl From<&StoredFinding> for Finding {
-    fn from(f: &StoredFinding) -> Self {
-        Finding {
-            rule_id: f.rule_id.clone(),
-            path: None,
-            line: None,
-            secret: f.secret.clone(),
-            fingerprint: f.fingerprint.clone(),
-        }
-    }
-}
+/// Bumped whenever the meaning of `state.json` changes; other versions are rebuilt from git.
+pub const STATE_VERSION: u32 = 2;
 
 /// `state.json`: what a restart needs to serve the last snapshot before any network call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StateFile {
+    pub state_version: u32,
     pub commit: Oid,
     pub commit_time: DateTime<Utc>,
     pub commit_subject: String,
     pub worktree: PathBuf,
     pub pulled_at: DateTime<Utc>,
     pub findings: Vec<StoredFinding>,
+    /// The worktree went through `redact_at_rest` with the findings' values.
+    pub redacted_at_rest: bool,
+    /// Paths of the worktree files the redaction pass rewrote.
+    pub rewritten_files: Vec<String>,
+    /// The kept history was scanned too (`features.file_at_commit`).
+    pub history_scanned: bool,
 }
 
 impl StateFile {
+    /// Fails with `InvalidData` on malformed JSON or a different `state_version`.
     pub fn read(path: &Path) -> std::io::Result<StateFile> {
         let bytes = std::fs::read(path)?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let invalid = |e: String| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+        let version = value
+            .get("state_version")
+            .and_then(serde_json::Value::as_u64);
+        if version != Some(u64::from(STATE_VERSION)) {
+            return Err(invalid(format!(
+                "state_version {version:?} is not {STATE_VERSION}"
+            )));
+        }
+        serde_json::from_value(value).map_err(|e| invalid(e.to_string()))
     }
 
     /// Writes a 0600 temp file beside `path`, then renames it into place.
@@ -878,22 +1032,29 @@ mod tests {
         assert!(reg.visible_to(Some(&[])).is_empty());
     }
 
+    fn state_file(dir: &Path) -> StateFile {
+        StateFile {
+            state_version: STATE_VERSION,
+            commit: Oid::parse(&"b".repeat(40)).unwrap(),
+            commit_time: Utc::now(),
+            commit_subject: "hello".into(),
+            worktree: dir.join("wt"),
+            pulled_at: Utc::now(),
+            findings: vec![StoredFinding {
+                rule_id: "rule".into(),
+                fingerprint: "a.txt:rule:1".into(),
+            }],
+            redacted_at_rest: true,
+            rewritten_files: vec!["a.txt".into()],
+            history_scanned: false,
+        }
+    }
+
     #[test]
     fn state_file_round_trip_and_mode() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repo").join("state.json");
-        let sf = StateFile {
-            commit: Oid::parse(&"b".repeat(40)).unwrap(),
-            commit_time: Utc::now(),
-            commit_subject: "hello".into(),
-            worktree: dir.path().join("wt"),
-            pulled_at: Utc::now(),
-            findings: vec![StoredFinding {
-                rule_id: "rule".into(),
-                secret: "s3cr3t-value".into(),
-                fingerprint: "a.txt:rule:1".into(),
-            }],
-        };
+        let sf = state_file(dir.path());
         sf.write(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -901,10 +1062,257 @@ mod tests {
         assert_eq!(back.commit, sf.commit);
         assert_eq!(back.findings, sf.findings);
         assert_eq!(back.commit_subject, "hello");
+        assert!(back.redacted_at_rest);
+        assert_eq!(back.rewritten_files, ["a.txt"]);
         sf.write(&path).unwrap();
         let leftovers = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1);
-        assert!(!format!("{:?}", sf.findings[0]).contains("s3cr3t"));
+    }
+
+    #[test]
+    fn state_file_never_holds_secret_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        state_file(dir.path()).write(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let finding = v["findings"][0].as_object().unwrap();
+        let mut keys: Vec<&str> = finding.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["fingerprint", "rule_id"]);
+        assert_eq!(v["state_version"], STATE_VERSION);
+    }
+
+    #[test]
+    fn state_file_from_another_version_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let old = serde_json::json!({
+            "commit": "b".repeat(40),
+            "commit_time": Utc::now(),
+            "commit_subject": "s",
+            "worktree": "/x",
+            "pulled_at": Utc::now(),
+            "findings": [{"rule_id": "r", "secret": "s3cr3t-value", "fingerprint": "f"}],
+        });
+        std::fs::write(&path, old.to_string()).unwrap();
+        let err = StateFile::read(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let mut v = serde_json::to_value(state_file(dir.path())).unwrap();
+        v["state_version"] = serde_json::json!(STATE_VERSION + 1);
+        std::fs::write(&path, v.to_string()).unwrap();
+        assert!(StateFile::read(&path).is_err());
+        v["state_version"] = serde_json::json!(STATE_VERSION);
+        v["findings"][0]["secret"] = serde_json::json!("s3cr3t-value");
+        std::fs::write(&path, v.to_string()).unwrap();
+        assert!(
+            StateFile::read(&path).is_err(),
+            "a secret field is never accepted"
+        );
+    }
+
+    #[test]
+    fn scan_hold_marks_the_repo_stale() {
+        let state = RepoState::new(repo_cfg("a"));
+        let stale_after = Duration::from_secs(1800);
+        state.set_snapshot(Arc::new(tmp_snapshot(PathBuf::from("/nonexistent"))));
+        state.record_success();
+        let now = Utc::now() + chrono::Duration::seconds(90);
+        assert_eq!(state.status_word(stale_after, now), RepoStatus::Ready);
+        assert_eq!(state.stale_seconds(stale_after, now), 0);
+        let tip = Oid::parse(&"c".repeat(40)).unwrap();
+        state.record_hold(2, tip.clone());
+        state.record_failure(PullError {
+            class: ErrorClass::SecretFound,
+            message: "held".into(),
+        });
+        assert_eq!(state.status_word(stale_after, now), RepoStatus::Stale);
+        let secs = state.stale_seconds(stale_after, now);
+        assert!((89..=91).contains(&secs), "{secs}");
+        let st = state.status();
+        assert_eq!(st.held_commit, Some(tip));
+        assert_eq!(st.last_error.unwrap().class, ErrorClass::SecretFound);
+        state.record_success();
+        let st = state.status();
+        assert!(!st.scan_held && st.held_commit.is_none());
+        assert_eq!(state.status_word(stale_after, now), RepoStatus::Ready);
+    }
+
+    #[test]
+    fn hold_without_a_snapshot_stays_unavailable() {
+        let state = RepoState::new(repo_cfg("a"));
+        state.record_hold(1, Oid::parse(&"d".repeat(40)).unwrap());
+        state.record_failure(PullError {
+            class: ErrorClass::SecretFound,
+            message: "held".into(),
+        });
+        let now = Utc::now();
+        assert_eq!(
+            state.status_word(Duration::from_secs(60), now),
+            RepoStatus::Unavailable
+        );
+        assert_eq!(state.stale_seconds(Duration::from_secs(60), now), 0);
+    }
+
+    #[test]
+    fn set_size_updates_entry_and_listing() {
+        let mut idx = sample();
+        idx.set_size(&rp("src/util/mod.rs"), 42);
+        assert_eq!(idx.get(&rp("src/util/mod.rs")).unwrap().size, 42);
+        let listed = idx
+            .children(&rp("src/util"))
+            .into_iter()
+            .find(|c| c.name() == "mod.rs")
+            .unwrap();
+        assert_eq!(listed.size, Some(42));
+        idx.set_size(&rp("README.md"), 3);
+        assert_eq!(
+            idx.children(&RepoPath::root())
+                .into_iter()
+                .find(|c| c.name() == "README.md")
+                .unwrap()
+                .size,
+            Some(3)
+        );
+        idx.set_size(&rp("missing.txt"), 9);
+        assert!(idx.get(&rp("missing.txt")).is_none());
+    }
+
+    fn fake_aws() -> String {
+        format!("{}{}", "AKIA", "QYLPMN5HHHFPZAM2")
+    }
+
+    fn fake_pem() -> String {
+        let label = ["RSA", "PRIVATE", "KEY"].join(" ");
+        [
+            format!("-----BEGIN {label}-----"),
+            "MIIEowIBAAKCAQEAfakefakefakefakefakefakefakefake".into(),
+            "Zm9vYmFyYmF6cXV4fakefakefakefakefakefakefakefake".into(),
+            format!("-----END {label}-----"),
+        ]
+        .join("\n")
+    }
+
+    struct RestFx {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        index: FileIndex,
+    }
+
+    fn rest_fixture() -> RestFx {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wt");
+        let files: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "deploy/values.yaml",
+                format!(
+                    "aws: {}\ntls_key: |\n{}\nreplicas: 2\n",
+                    fake_aws(),
+                    fake_pem()
+                )
+                .into_bytes(),
+            ),
+            (
+                "notes/copy.txt",
+                format!("again {}\nand {}\n", fake_pem(), fake_aws()).into_bytes(),
+            ),
+            ("clean.txt", b"nothing here\n".to_vec()),
+            ("bin/blob.bin", {
+                let mut b = vec![0u8, 1, 2];
+                b.extend(fake_aws().into_bytes());
+                b
+            }),
+            (
+                "big.txt",
+                format!("{}{}", "x".repeat(1000), fake_aws()).into_bytes(),
+            ),
+            ("wide.txt", {
+                let mut b = vec![0xFF, 0xFE];
+                b.extend(fake_aws().bytes().flat_map(|c| [c, 0]));
+                b
+            }),
+        ];
+        let mut entries = Vec::new();
+        for (path, body) in &files {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, body).unwrap();
+            entries.push(TreeEntry {
+                path: rp(path),
+                kind: EntryKind::File,
+                size: body.len() as u64,
+            });
+        }
+        RestFx {
+            _tmp: tmp,
+            root,
+            index: FileIndex::from_entries(entries),
+        }
+    }
+
+    fn read(root: &Path, path: &str) -> Vec<u8> {
+        std::fs::read(root.join(path)).unwrap()
+    }
+
+    #[test]
+    fn rest_pass_rewrites_every_file_holding_a_secret() {
+        let mut fx = rest_fixture();
+        let red = Redactor::new(&[
+            (fake_aws(), "aws-access-token".into()),
+            (fake_pem(), "private-key".into()),
+        ]);
+        let n = redact_at_rest(&fx.root, &mut fx.index, &red, 600).unwrap();
+        assert_eq!(n, 2);
+
+        let yaml = String::from_utf8(read(&fx.root, "deploy/values.yaml")).unwrap();
+        assert_eq!(
+            yaml,
+            "aws: [REDACTED:aws-access-token]\ntls_key: |\n[REDACTED:private-key]\n[REDACTED:private-key]\n[REDACTED:private-key]\n[REDACTED:private-key]\nreplicas: 2\n"
+        );
+        let copy = String::from_utf8(read(&fx.root, "notes/copy.txt")).unwrap();
+        assert!(
+            !copy.contains("AKIA") && !copy.contains("fakefake"),
+            "{copy}"
+        );
+        assert_eq!(copy.lines().count(), 5);
+        for path in ["deploy/values.yaml", "notes/copy.txt", "clean.txt"] {
+            let on_disk = read(&fx.root, path).len() as u64;
+            assert_eq!(fx.index.get(&rp(path)).unwrap().size, on_disk, "{path}");
+        }
+        assert!(read(&fx.root, "bin/blob.bin").ends_with(fake_aws().as_bytes()));
+        assert!(read(&fx.root, "big.txt").ends_with(fake_aws().as_bytes()));
+        assert!(fx.index.is_utf16(&rp("wide.txt")));
+        assert!(!fx.index.is_utf16(&rp("clean.txt")));
+        let marked: Vec<&str> = fx.index.redacted_paths().map(RepoPath::as_str).collect();
+        assert_eq!(marked, ["deploy/values.yaml", "notes/copy.txt"]);
+        assert!(!fx.index.is_redacted(&rp("clean.txt")));
+    }
+
+    #[test]
+    fn rest_pass_with_an_empty_redactor_leaves_files_intact() {
+        let mut fx = rest_fixture();
+        let before = read(&fx.root, "deploy/values.yaml");
+        let n = redact_at_rest(&fx.root, &mut fx.index, &Redactor::empty(), 1 << 20).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(read(&fx.root, "deploy/values.yaml"), before);
+        assert!(fx.index.is_utf16(&rp("wide.txt")));
+    }
+
+    #[test]
+    fn rest_pass_never_follows_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, fake_aws()).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let mut index = FileIndex::from_entries(vec![TreeEntry {
+            path: rp("link"),
+            kind: EntryKind::File,
+            size: 5,
+        }]);
+        let red = Redactor::new(&[(fake_aws(), "aws".into())]);
+        assert_eq!(redact_at_rest(&root, &mut index, &red, 1 << 20).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), fake_aws());
     }
 
     #[test]

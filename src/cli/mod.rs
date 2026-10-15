@@ -91,8 +91,6 @@ enum Command {
     Status,
     /// Exit 0 when the running server answers /healthz (used by the container healthcheck)
     Healthcheck,
-    #[command(hide = true)]
-    Askpass { prompt: String },
 }
 
 pub async fn run() -> ExitCode {
@@ -109,7 +107,6 @@ pub async fn run() -> ExitCode {
         Command::Scan { repo } => scan::run(&cli.config, &repo).await,
         Command::Status => client::status(&cli.config).await,
         Command::Healthcheck => client::healthcheck(&cli.config).await,
-        Command::Askpass { prompt } => return git::askpass::run(&prompt),
     };
     ExitCode::from(code)
 }

@@ -55,37 +55,45 @@ impl GitError {
     }
 }
 
+const AUTH_PHRASES: &[&str] = &[
+    "authentication failed",
+    "could not read username",
+    "could not read password",
+    "permission denied (publickey)",
+    "invalid username or token",
+    "http 401",
+    "http 403",
+    "returned error: 401",
+    "returned error: 403",
+];
+const NOT_FOUND_PHRASES: &[&str] = &[
+    "repository not found",
+    "not found",
+    "returned error: 404",
+    "http 404",
+    "does not appear to be a git repository",
+    "could not find remote branch",
+    "couldn't find remote ref",
+    "does not exist",
+    "needed a single revision",
+    "unknown revision",
+];
+const NETWORK_PHRASES: &[&str] = &[
+    "could not resolve host",
+    "connection refused",
+    "timed out",
+    "unable to access",
+    "connection reset",
+];
+
 fn classify(stderr: &str) -> ErrorClass {
     let lower = stderr.to_ascii_lowercase();
-    let has = |needles: &[&str]| {
-        needles
-            .iter()
-            .any(|n| lower.contains(&n.to_ascii_lowercase()))
-    };
-    if has(&[
-        "Authentication failed",
-        "401",
-        "403",
-        "could not read Username",
-        "Permission denied (publickey)",
-    ]) {
+    let has = |phrases: &[&str]| phrases.iter().any(|p| lower.contains(p));
+    if has(AUTH_PHRASES) {
         ErrorClass::Auth
-    } else if has(&[
-        "Repository not found",
-        "not found",
-        "does not exist",
-        "404",
-        "needed a single revision",
-        "unknown revision",
-    ]) {
+    } else if has(NOT_FOUND_PHRASES) {
         ErrorClass::NotFound
-    } else if has(&[
-        "Could not resolve host",
-        "Connection refused",
-        "timed out",
-        "unable to access",
-        "Connection reset",
-    ]) {
+    } else if has(NETWORK_PHRASES) {
         ErrorClass::Network
     } else {
         ErrorClass::Internal
@@ -1272,6 +1280,44 @@ mod tests {
             ErrorClass::NotFound
         );
         assert_eq!(classify("something odd"), ErrorClass::Internal);
+    }
+
+    #[test]
+    fn classify_ignores_bare_status_digits() {
+        assert_eq!(
+            classify(
+                "fatal: unable to access 'https://host:4403/x.git': Could not resolve host: host"
+            ),
+            ErrorClass::Network
+        );
+        assert_eq!(
+            classify("fatal: bad object deadbeef404cafe0123"),
+            ErrorClass::Internal
+        );
+        assert_eq!(
+            classify("fatal: unable to access 'https://203.0.113.40:4013/r.git/': timed out"),
+            ErrorClass::Network
+        );
+        assert_eq!(
+            classify("remote: HTTP 401 for https://h/r.git"),
+            ErrorClass::Auth
+        );
+        assert_eq!(
+            classify("fatal: The requested URL returned error: 404"),
+            ErrorClass::NotFound
+        );
+        assert_eq!(
+            classify("fatal: 'https://h/r.git' does not appear to be a git repository"),
+            ErrorClass::NotFound
+        );
+        assert_eq!(
+            classify("fatal: couldn't find remote ref refs/heads/zz"),
+            ErrorClass::NotFound
+        );
+        assert_eq!(
+            classify("remote: Invalid username or token."),
+            ErrorClass::Auth
+        );
     }
 
     #[test]

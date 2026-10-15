@@ -11,16 +11,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, Credential, OnScanError, ScanPolicy};
 use crate::git::{self, CredentialFiles, GitError, GitRunner, Oid, ResolvedCredential};
+use crate::paths::RepoPath;
 use crate::proc;
 use crate::redact::Redactor;
 use crate::scan::{self, Finding, Scanner};
 use crate::snapshot::{
-    ErrorClass, FileIndex, PullError, Registry, RepoDirs, RepoState, Snapshot, StateFile,
-    StoredFinding, data_layout,
+    ErrorClass, FileIndex, PullError, Registry, RepoDirs, RepoState, STATE_VERSION, Snapshot,
+    StateFile, StoredFinding, data_layout, redact_at_rest,
 };
 
 const BACKOFF_BASE: Duration = Duration::from_secs(30);
-const COMMIT_MESSAGES_FILE: &str = "commit_messages";
+/// File name of the commit messages handed to the scanner; fingerprints start with it.
+pub const COMMIT_MESSAGES_FILE: &str = "commit_messages";
 static NO_CREDENTIAL: ResolvedCredential = ResolvedCredential::None;
 
 /// Credential name to ready-to-use git credential. Owns the temp files written for env-var secrets.
@@ -212,17 +214,38 @@ async fn try_restore(
         Ok(oid) if oid == sf.commit => {}
         _ => return None,
     }
-    let policy = state.cfg.scan_policy_or(deps.config.scan.policy);
-    let stored: Vec<Finding> = sf.findings.iter().map(Finding::from).collect();
-    let findings = scan::apply_allowlist(stored, &deps.config.scan.allowlist);
-    if policy == ScanPolicy::Block && !findings.is_empty() {
+    let cfg = &deps.config;
+    let policy = state.cfg.scan_policy_or(cfg.scan.policy);
+    let findings: Vec<&StoredFinding> = sf
+        .findings
+        .iter()
+        .filter(|f| !cfg.scan.allowlist.contains(&f.fingerprint))
+        .collect();
+    let rebuild = (policy == ScanPolicy::Block && !findings.is_empty())
+        || (policy == ScanPolicy::Redact && !findings.is_empty() && !sf.redacted_at_rest)
+        || (cfg.features.file_at_commit && !sf.history_scanned);
+    if rebuild {
         return None;
     }
     let tree = deps.git.ls_tree(&dirs.git, &sf.commit).await.ok()?;
     let index = FileIndex::from_git(tree).ok()?;
-    let redactor = match policy {
-        ScanPolicy::Redact => scan::findings_to_redactor(&findings),
-        ScanPolicy::Warn | ScanPolicy::Block => Redactor::empty(),
+    let root = sf.worktree.clone();
+    let max = cfg.limits.max_file_bytes;
+    let rewritten = sf.rewritten_files.clone();
+    let index = tokio::task::spawn_blocking(move || {
+        let mut index = index;
+        for path in rewritten.iter().filter_map(|p| RepoPath::parse(p).ok()) {
+            index.mark_redacted(&path);
+        }
+        redact_at_rest(&root, &mut index, &Redactor::empty(), max).map(|_| index)
+    })
+    .await
+    .ok()?
+    .ok()?;
+    let redactor = if policy == ScanPolicy::Redact && !findings.is_empty() {
+        restore_redactor(deps, state, dirs, &sf.commit).await?
+    } else {
+        Redactor::empty()
     };
     let snapshot = Snapshot::new(
         sf.commit.clone(),
@@ -233,7 +256,8 @@ async fn try_restore(
         Arc::new(redactor),
         findings.len(),
         sf.pulled_at,
-    );
+    )
+    .with_rewritten_files(sf.rewritten_files.len());
     state.set_snapshot(Arc::new(snapshot));
     state.record_restored(sf.pulled_at, findings.len());
     tracing::info!(
@@ -244,6 +268,45 @@ async fn try_restore(
         result = "restored",
     );
     Some(sf.worktree)
+}
+
+/// The worktree is already redacted on disk; this rebuilds the in-memory wall for commit messages
+/// and history by rescanning them. `None` asks for a full rebuild.
+async fn restore_redactor(
+    deps: &PullerDeps,
+    state: &RepoState,
+    dirs: &RepoDirs,
+    tip: &Oid,
+) -> Option<Redactor> {
+    let cfg = &deps.config;
+    let messages = write_commit_messages(&deps.git, &dirs.git, tip, cfg.pull.depth)
+        .await
+        .ok()?;
+    let empty = messages.scratch.path().join("tree");
+    tokio::fs::create_dir(&empty).await.ok()?;
+    let history = cfg
+        .features
+        .file_at_commit
+        .then_some((dirs.git.as_path(), tip));
+    match scan::scan_snapshot(
+        &*deps.scanner,
+        &empty,
+        &messages.file,
+        history,
+        &cfg.scan.allowlist,
+    )
+    .await
+    {
+        Ok(found) => Some(scan::findings_to_redactor(&found)),
+        Err(e) if cfg.scan.on_scan_error == OnScanError::Serve => {
+            tracing::warn!(event = "scan", repo = %state.cfg.id, commit = %tip.short(), action = "served_unscanned", error = %git::scrub_stderr(&e.to_string()));
+            Some(Redactor::empty())
+        }
+        Err(e) => {
+            tracing::warn!(event = "scan", repo = %state.cfg.id, commit = %tip.short(), action = "rebuild", error = %git::scrub_stderr(&e.to_string()));
+            None
+        }
+    }
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -326,15 +389,28 @@ async fn pull_inner(deps: &PullerDeps, state: &Arc<RepoState>) -> Result<PullOut
     if state.snapshot().is_some_and(|s| s.commit == tip) {
         return Ok(PullOutcome::Unchanged);
     }
+    let status = state.status();
+    if status.held_commit.as_ref() == Some(&tip) {
+        return Err(held_error(status.scan_findings, &tip));
+    }
 
     let built = build_snapshot(deps, state, &dirs, &tip).await?;
     let state_file = StateFile {
+        state_version: STATE_VERSION,
         commit: built.snapshot.commit.clone(),
         commit_time: built.snapshot.commit_time,
         commit_subject: built.snapshot.commit_subject.clone(),
         worktree: built.snapshot.root.clone(),
         pulled_at: built.snapshot.pulled_at,
         findings: built.findings.iter().map(StoredFinding::from).collect(),
+        redacted_at_rest: built.redacted_at_rest,
+        rewritten_files: built
+            .snapshot
+            .index
+            .redacted_paths()
+            .map(|p| p.as_str().to_owned())
+            .collect(),
+        history_scanned: built.history_scanned,
     };
     let state_path = dirs.state.clone();
     match tokio::task::spawn_blocking(move || state_file.write(&state_path)).await {
@@ -407,9 +483,80 @@ async fn clone_into(
         .map_err(|e| internal(format!("cannot move the fresh clone into place: {e}")))
 }
 
+fn held_error(count: usize, tip: &Oid) -> PullError {
+    PullError {
+        class: ErrorClass::SecretFound,
+        message: format!(
+            "{count} secret finding(s) in {} after the allowlist; snapshot not published (scan.policy = block)",
+            tip.short()
+        ),
+    }
+}
+
 struct Built {
     snapshot: Snapshot,
     findings: Vec<Finding>,
+    redacted_at_rest: bool,
+    history_scanned: bool,
+}
+
+/// Commit messages of the kept history, in a private temp dir that lives as long as this value.
+pub struct MessagesFile {
+    pub file: PathBuf,
+    scratch: tempfile::TempDir,
+}
+
+async fn write_commit_messages(
+    git: &GitRunner,
+    repo_dir: &Path,
+    tip: &Oid,
+    depth: u32,
+) -> Result<MessagesFile, PullError> {
+    let messages = git
+        .commit_messages(repo_dir, tip, depth as usize)
+        .await
+        .map_err(git_err)?;
+    let scratch = tempfile::Builder::new()
+        .prefix("cex-msgs-")
+        .tempdir()
+        .map_err(|e| internal(format!("cannot create scan scratch dir: {e}")))?;
+    let file = scratch.path().join(COMMIT_MESSAGES_FILE);
+    tokio::fs::write(&file, messages)
+        .await
+        .map_err(|e| internal(format!("cannot write commit messages: {e}")))?;
+    Ok(MessagesFile { file, scratch })
+}
+
+/// What a snapshot scan reads: the worktree checked out at the tip and the commit messages.
+pub struct ScanInputs {
+    pub worktree: PathBuf,
+    pub messages: MessagesFile,
+}
+
+/// Checks `tip` out at `worktree` and writes the commit messages. Used by the puller and by the
+/// `scan` command so both scan the same inputs; the worktree is removed again on failure.
+pub async fn prepare_scan_inputs(
+    git: &GitRunner,
+    repo_dir: &Path,
+    tip: &Oid,
+    depth: u32,
+    worktree: &Path,
+) -> Result<ScanInputs, PullError> {
+    git.worktree_add(repo_dir, tip, worktree)
+        .await
+        .map_err(git_err)?;
+    match write_commit_messages(git, repo_dir, tip, depth).await {
+        Ok(messages) => Ok(ScanInputs {
+            worktree: worktree.to_path_buf(),
+            messages,
+        }),
+        Err(e) => {
+            if let Err(clean) = git.worktree_remove(repo_dir, worktree).await {
+                tracing::warn!(error = %git::scrub_stderr(&clean.to_string()), "could not remove an unused worktree");
+            }
+            Err(e)
+        }
+    }
 }
 
 async fn build_snapshot(
@@ -430,11 +577,9 @@ async fn build_snapshot(
             Utc::now().timestamp_millis()
         ));
     }
-    deps.git
-        .worktree_add(&dirs.git, tip, &dest)
-        .await
-        .map_err(git_err)?;
-    match prepare_snapshot(deps, state, dirs, tip, &dest).await {
+    let inputs =
+        prepare_scan_inputs(&deps.git, &dirs.git, tip, deps.config.pull.depth, &dest).await?;
+    match prepare_snapshot(deps, state, dirs, tip, &inputs).await {
         Ok(built) => Ok(built),
         Err(e) => {
             if let Err(clean) = deps.git.worktree_remove(&dirs.git, &dest).await {
@@ -450,7 +595,7 @@ async fn prepare_snapshot(
     state: &RepoState,
     dirs: &RepoDirs,
     tip: &Oid,
-    dest: &Path,
+    inputs: &ScanInputs,
 ) -> Result<Built, PullError> {
     let tree = deps.git.ls_tree(&dirs.git, tip).await.map_err(git_err)?;
     let index = FileIndex::from_git(tree).map_err(|e| internal(e.to_string()))?;
@@ -459,35 +604,31 @@ async fn prepare_snapshot(
         .commit_meta(&dirs.git, tip)
         .await
         .map_err(git_err)?;
-    let messages = deps
-        .git
-        .commit_messages(&dirs.git, tip, deps.config.pull.depth as usize)
-        .await
-        .map_err(git_err)?;
-    let scratch = tempfile::Builder::new()
-        .prefix("cex-msgs-")
-        .tempdir()
-        .map_err(|e| internal(format!("cannot create scan scratch dir: {e}")))?;
-    let messages_file = scratch.path().join(COMMIT_MESSAGES_FILE);
-    tokio::fs::write(&messages_file, messages)
-        .await
-        .map_err(|e| internal(format!("cannot write commit messages: {e}")))?;
 
     let repo = &state.cfg.id;
-    let policy = state.cfg.scan_policy_or(deps.config.scan.policy);
-    let scanned = deps.scanner.scan_dir(dest, &[messages_file]).await;
-    drop(scratch);
+    let cfg = &deps.config;
+    let policy = state.cfg.scan_policy_or(cfg.scan.policy);
+    let history_scanned = cfg.features.file_at_commit;
+    let history = history_scanned.then_some((dirs.git.as_path(), tip));
+    let scanned = scan::scan_snapshot(
+        &*deps.scanner,
+        &inputs.worktree,
+        &inputs.messages.file,
+        history,
+        &cfg.scan.allowlist,
+    )
+    .await;
 
     let findings = match scanned {
-        Ok(found) => scan::apply_allowlist(found, &deps.config.scan.allowlist),
+        Ok(found) => found,
         Err(e) => {
             let message = git::scrub_stderr(&e.to_string());
-            let action = match deps.config.scan.on_scan_error {
+            let action = match cfg.scan.on_scan_error {
                 OnScanError::Hold => "hold",
                 OnScanError::Serve => "served_unscanned",
             };
             tracing::warn!(event = "scan", repo = %repo, commit = %tip.short(), policy = ?policy, action, error = %message);
-            if deps.config.scan.on_scan_error == OnScanError::Hold {
+            if cfg.scan.on_scan_error == OnScanError::Hold {
                 return Err(PullError {
                     class: ErrorClass::Scan,
                     message: format!("scanner failed, keeping the previous snapshot: {message}"),
@@ -503,14 +644,6 @@ async fn prepare_snapshot(
         (ScanPolicy::Warn, _) => "warned",
         (ScanPolicy::Block, _) => "held",
     };
-    tracing::info!(
-        event = "scan",
-        repo = %repo,
-        commit = %tip.short(),
-        findings = count,
-        policy = ?policy,
-        action,
-    );
     if count > 0 {
         let mut rules: Vec<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
         rules.sort_unstable();
@@ -518,30 +651,50 @@ async fn prepare_snapshot(
         tracing::warn!(repo = %repo, commit = %tip.short(), findings = count, rules = %rules.join(","), "secrets found in snapshot");
     }
     if policy == ScanPolicy::Block && count > 0 {
-        state.record_scan(count, true);
-        return Err(PullError {
-            class: ErrorClass::SecretFound,
-            message: format!(
-                "{count} secret finding(s) in {} after the allowlist; snapshot not published (scan.policy = block)",
-                tip.short()
-            ),
-        });
+        tracing::info!(event = "scan", repo = %repo, commit = %tip.short(), findings = count, policy = ?policy, action, rewritten_files = 0);
+        state.record_hold(count, tip.clone());
+        return Err(held_error(count, tip));
     }
-    let redactor = match policy {
+    let redactor = Arc::new(match policy {
         ScanPolicy::Redact => scan::findings_to_redactor(&findings),
         ScanPolicy::Warn | ScanPolicy::Block => Redactor::empty(),
-    };
+    });
+    let root = inputs.worktree.clone();
+    let max = cfg.limits.max_file_bytes;
+    let pass = redactor.clone();
+    let (index, rewritten) = tokio::task::spawn_blocking(move || {
+        let mut index = index;
+        redact_at_rest(&root, &mut index, &pass, max).map(|n| (index, n))
+    })
+    .await
+    .map_err(|e| internal(format!("redaction pass failed: {e}")))?
+    .map_err(|e| internal(format!("cannot redact the worktree: {e}")))?;
+    tracing::info!(
+        event = "scan",
+        repo = %repo,
+        commit = %tip.short(),
+        findings = count,
+        policy = ?policy,
+        action,
+        rewritten_files = rewritten,
+    );
     let snapshot = Snapshot::new(
         tip.clone(),
         meta.time,
         meta.subject,
-        dest.to_path_buf(),
+        inputs.worktree.clone(),
         index,
-        Arc::new(redactor),
+        redactor,
         count,
         Utc::now(),
-    );
-    Ok(Built { snapshot, findings })
+    )
+    .with_rewritten_files(rewritten);
+    Ok(Built {
+        snapshot,
+        findings,
+        redacted_at_rest: policy == ScanPolicy::Redact,
+        history_scanned,
+    })
 }
 
 #[cfg(test)]
@@ -608,6 +761,13 @@ mod tests {
         ) -> BoxFuture<'a, Result<Vec<Finding>, ScanError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+        fn scan_git<'a>(
+            &'a self,
+            _: &'a Path,
+            _: &'a Oid,
+        ) -> BoxFuture<'a, Result<Vec<Finding>, ScanError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
         fn name(&self) -> &str {
             "none"
         }
@@ -626,8 +786,60 @@ mod tests {
         ) -> BoxFuture<'a, Result<Vec<Finding>, ScanError>> {
             Box::pin(async { Err(ScanError::Failed("boom".into())) })
         }
+        fn scan_git<'a>(
+            &'a self,
+            _: &'a Path,
+            _: &'a Oid,
+        ) -> BoxFuture<'a, Result<Vec<Finding>, ScanError>> {
+            Box::pin(async { Err(ScanError::Failed("boom".into())) })
+        }
         fn name(&self) -> &str {
             "broken"
+        }
+        fn version(&self) -> BoxFuture<'_, Option<String>> {
+            Box::pin(async { None })
+        }
+    }
+
+    /// Reports one fixed finding from every worktree scan and counts the scans.
+    #[derive(Default)]
+    struct Counting {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Counting {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Scanner for Counting {
+        fn scan_dir<'a>(
+            &'a self,
+            _: &'a Path,
+            _: &'a [PathBuf],
+        ) -> BoxFuture<'a, Result<Vec<Finding>, ScanError>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(vec![Finding {
+                    rule_id: "fake".into(),
+                    path: Some("README.md".into()),
+                    line: Some(1),
+                    secret: "fake-secret-value".into(),
+                    fingerprint: "README.md:fake:1".into(),
+                    commit: None,
+                }])
+            })
+        }
+        fn scan_git<'a>(
+            &'a self,
+            _: &'a Path,
+            _: &'a Oid,
+        ) -> BoxFuture<'a, Result<Vec<Finding>, ScanError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn name(&self) -> &str {
+            "counting"
         }
         fn version(&self) -> BoxFuture<'_, Option<String>> {
             Box::pin(async { None })
@@ -888,6 +1100,19 @@ mod tests {
             sf.findings[0].fingerprint,
             "config/app.txt:aws-access-token:1"
         );
+        assert!(sf.redacted_at_rest);
+        assert_eq!(sf.rewritten_files, ["config/app.txt"]);
+        let raw_state = std::fs::read_to_string(fx.dirs().state).unwrap();
+        assert!(!raw_state.contains(&fake_aws()) && !raw_state.contains("\"secret\""));
+
+        assert_eq!(snap.rewritten_files, 1);
+        let on_disk = std::fs::read_to_string(snap.root.join("config/app.txt")).unwrap();
+        assert_eq!(on_disk, "key = \"[REDACTED:aws-access-token]\"\n");
+        let entry = snap
+            .index
+            .get(&crate::paths::RepoPath::parse("config/app.txt").unwrap())
+            .unwrap();
+        assert_eq!(entry.size, on_disk.len() as u64);
     }
 
     #[tokio::test]
@@ -899,6 +1124,10 @@ mod tests {
         assert_eq!(snap.findings, 1);
         assert!(snap.redactor.is_empty());
         assert!(!fx.state.status().scan_held);
+        assert_eq!(snap.rewritten_files, 0);
+        let on_disk = std::fs::read_to_string(snap.root.join("config/app.txt")).unwrap();
+        assert!(on_disk.contains(&fake_aws()));
+        assert!(!StateFile::read(&fx.dirs().state).unwrap().redacted_at_rest);
     }
 
     #[tokio::test]
@@ -937,6 +1166,10 @@ mod tests {
         );
         assert_eq!(fx.worktrees(), 1, "held worktree removed");
         assert_eq!(StateFile::read(&fx.dirs().state).unwrap().commit, clean);
+        assert_eq!(
+            fx.state.status_word(Duration::from_secs(3600), Utc::now()),
+            RepoStatus::Stale
+        );
 
         remove_file_commit(&fx.src, "leak.txt", "remove it");
         let tip = head(&fx.src);
@@ -990,7 +1223,9 @@ mod tests {
     #[tokio::test]
     async fn restart_serves_stored_snapshot_before_any_network() {
         let Some(scanner) = gitleaks() else { return };
-        let fx = fixture_with("policy = \"redact\"", scanner, true);
+        let fx = fixture_with("policy = \"redact\"", scanner.clone(), true);
+        let pasted = format!("rotate {}", fake_aws());
+        commit(&fx.src, "docs/rotate.md", "rotated\n", &pasted);
         pull_once(&fx.deps, &fx.state).await.unwrap();
         let commit_id = fx.state.snapshot().unwrap().commit.clone();
         let root = fx.state.snapshot().unwrap().root.clone();
@@ -999,22 +1234,25 @@ mod tests {
 
         let missing = fx.tmp.path().join("no-such-remote");
         let text = config_text(fx.tmp.path(), &missing, "policy = \"redact\"");
-        let (deps2, state2) = deps_from(load_config(&text), Arc::new(NoScan));
+        let (deps2, state2) = deps_from(load_config(&text), scanner);
         assert!(state2.snapshot().is_none());
         assert!(restore_state(&deps2, &state2).await);
 
         let snap = state2.snapshot().unwrap();
         assert_eq!(snap.commit, commit_id);
         assert_eq!(snap.root, root);
-        assert_eq!(snap.findings, 1);
-        let key = fake_aws();
-        let (out, hit) = snap.redactor.redact(&key);
-        assert!(hit, "{out}");
+        assert_eq!(snap.findings, 2);
+        assert_eq!(snap.rewritten_files, 1);
+        let (out, hit) = snap.redactor.redact(&pasted);
         assert!(
-            snap.index
-                .get(&crate::paths::RepoPath::parse("config/app.txt").unwrap())
-                .is_some()
+            hit,
+            "commit messages are redacted again after a restart: {out}"
         );
+        let app = crate::paths::RepoPath::parse("config/app.txt").unwrap();
+        let on_disk = std::fs::read(root.join("config/app.txt")).unwrap();
+        assert!(!String::from_utf8_lossy(&on_disk).contains(&fake_aws()));
+        assert_eq!(snap.index.get(&app).unwrap().size, on_disk.len() as u64);
+        assert!(snap.index.is_redacted(&app));
         assert_eq!(
             state2.status_word(Duration::from_secs(60), Utc::now()),
             RepoStatus::Ready
@@ -1028,6 +1266,109 @@ mod tests {
             ErrorClass::Network | ErrorClass::Internal
         ));
         assert_eq!(state2.snapshot().unwrap().commit, commit_id);
+    }
+
+    #[tokio::test]
+    async fn restore_rebuilds_when_the_state_does_not_match_the_config() {
+        let Some(scanner) = gitleaks() else { return };
+        let fx = fixture_with("policy = \"warn\"", scanner.clone(), true);
+        pull_once(&fx.deps, &fx.state).await.unwrap();
+        let sf = StateFile::read(&fx.dirs().state).unwrap();
+        assert!(!sf.redacted_at_rest);
+
+        let redact = config_text(fx.tmp.path(), &fx.src, "policy = \"redact\"");
+        let (deps, state) = deps_from(load_config(&redact), scanner.clone());
+        assert!(
+            !restore_state(&deps, &state).await,
+            "raw worktree under redact"
+        );
+
+        let history = config_text(
+            fx.tmp.path(),
+            &fx.src,
+            "policy = \"warn\"\n[features]\nfile_at_commit = true",
+        );
+        let (deps, state) = deps_from(load_config(&history), scanner.clone());
+        assert!(!restore_state(&deps, &state).await, "history never scanned");
+
+        let mut old = serde_json::to_value(&sf).unwrap();
+        old["state_version"] = serde_json::json!(1);
+        std::fs::write(fx.dirs().state, old.to_string()).unwrap();
+        let warn = config_text(fx.tmp.path(), &fx.src, "policy = \"warn\"");
+        let (deps, state) = deps_from(load_config(&warn), scanner);
+        assert!(!restore_state(&deps, &state).await, "old state version");
+    }
+
+    #[tokio::test]
+    async fn held_tip_is_not_rebuilt_until_the_branch_moves() {
+        let counting = Arc::new(Counting::default());
+        let fx = fixture_with("policy = \"block\"", counting.clone(), false);
+        let err = pull_once(&fx.deps, &fx.state).await.unwrap_err();
+        assert_eq!(err.class, ErrorClass::SecretFound);
+        assert_eq!(counting.calls(), 1);
+        let tip = head(&fx.src);
+        assert_eq!(fx.state.status().held_commit, Some(tip));
+
+        let again = pull_once(&fx.deps, &fx.state).await.unwrap_err();
+        assert_eq!(again.class, ErrorClass::SecretFound);
+        assert_eq!(counting.calls(), 1, "same tip is not rescanned");
+        assert_eq!(fx.worktrees(), 0);
+        let st = fx.state.status();
+        assert!(st.scan_held);
+        assert_eq!(st.consecutive_failures, 2);
+
+        commit(&fx.src, "more.txt", "more\n", "more");
+        pull_once(&fx.deps, &fx.state).await.unwrap_err();
+        assert_eq!(counting.calls(), 2, "a new tip is scanned");
+        assert_eq!(fx.state.status().held_commit, Some(head(&fx.src)));
+    }
+
+    #[tokio::test]
+    async fn history_scan_covers_secrets_removed_before_the_tip() {
+        let Some(scanner) = gitleaks() else { return };
+        let fx = fixture_with(
+            "policy = \"redact\"\n[features]\nfile_at_commit = true",
+            scanner.clone(),
+            true,
+        );
+        remove_file_commit(&fx.src, "config/app.txt", "drop config");
+        pull_once(&fx.deps, &fx.state).await.unwrap();
+        let snap = fx.state.snapshot().unwrap();
+        assert_eq!(snap.findings, 1);
+        assert_eq!(snap.rewritten_files, 0);
+        let line = format!("key = \"{}\"", fake_aws());
+        let (out, hit) = snap.redactor.redact(&line);
+        assert!(hit, "{out}");
+        let sf = StateFile::read(&fx.dirs().state).unwrap();
+        assert!(sf.history_scanned);
+        assert!(
+            sf.findings[0]
+                .fingerprint
+                .ends_with(":config/app.txt:aws-access-token:1"),
+            "{:?}",
+            sf.findings
+        );
+
+        let (deps2, state2) = deps_from(
+            load_config(&config_text(
+                fx.tmp.path(),
+                &fx.src,
+                "policy = \"redact\"\n[features]\nfile_at_commit = true",
+            )),
+            scanner.clone(),
+        );
+        assert!(restore_state(&deps2, &state2).await);
+        let (_, hit) = state2.snapshot().unwrap().redactor.redact(&fake_aws());
+        assert!(hit, "history redactor rebuilt on restore");
+
+        let block = fixture_with(
+            "policy = \"block\"\n[features]\nfile_at_commit = true",
+            scanner,
+            true,
+        );
+        remove_file_commit(&block.src, "config/app.txt", "drop config");
+        let err = pull_once(&block.deps, &block.state).await.unwrap_err();
+        assert_eq!(err.class, ErrorClass::SecretFound);
     }
 
     #[tokio::test]

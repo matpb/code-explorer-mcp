@@ -18,6 +18,7 @@ type BinaryCheck = (
 type EnvFn<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 const MIN_PULL_INTERVAL: Duration = Duration::from_secs(30);
+const MIN_MAX_CONNECTIONS: usize = 16;
 const MIN_GIT: (u32, u32) = (2, 40);
 const MIN_RG: (u32, u32) = (13, 0);
 
@@ -118,6 +119,16 @@ impl Ctx<'_> {
 
     fn warn(&mut self, key: &str, message: impl Into<String>, fix: impl Into<String>) {
         self.add(false, key, message, fix);
+    }
+
+    /// True when the key is written in the config file, not defaulted.
+    fn explicit(&self, key: &str) -> bool {
+        let Some(doc) = &self.doc else { return true };
+        let mut item: Option<&Item> = Some(doc.as_item());
+        for seg in key.split('.') {
+            item = item.and_then(|i| i.get(seg));
+        }
+        item.is_some()
     }
 
     fn min_duration(&mut self, key: &str, value: Duration, min: Duration) {
@@ -229,11 +240,31 @@ fn server(c: &mut Ctx, cfg: &Config) {
             "use a name such as \"X-Forwarded-For\", or \"\" to ignore client IP headers",
         );
     }
-    if s.client_ip_header.is_some() && s.trusted_proxies.is_empty() {
+    if s.client_ip_header.is_some()
+        && s.trusted_proxies.is_empty()
+        && c.explicit("server.client_ip_header")
+    {
         c.warn(
             "server.trusted_proxies",
             "client_ip_header is set but trusted_proxies is empty, so the header is never honored",
             "list your proxy CIDRs, or set client_ip_header = \"\"",
+        );
+    }
+    if s.client_ip_header.is_none() && !s.trusted_proxies.is_empty() {
+        c.warn(
+            "server.client_ip_header",
+            "trusted_proxies is set but client_ip_header is empty, so every client appears as the proxy and shares one throttle bucket",
+            "set client_ip_header = \"X-Forwarded-For\" or the single-value header your proxy sets",
+        );
+    }
+    if s.max_connections < MIN_MAX_CONNECTIONS {
+        c.err(
+            "server.max_connections",
+            format!(
+                "{} is below the minimum of {MIN_MAX_CONNECTIONS}",
+                s.max_connections
+            ),
+            format!("set at least {MIN_MAX_CONNECTIONS}"),
         );
     }
     data_dir(c, &s.data_dir);
@@ -264,6 +295,13 @@ fn data_dir(c: &mut Ctx, dir: &Path) {
 fn auth(c: &mut Ctx, cfg: &Config) {
     let f = &cfg.auth.failed_attempts;
     let k = "auth.failed_attempts";
+    if cfg.auth.max_concurrent_verifications == 0 {
+        c.err(
+            "auth.max_concurrent_verifications",
+            "must be at least 1",
+            "set a small positive number such as 4",
+        );
+    }
     c.positive(&format!("{k}.max_failures"), f.max_failures.into());
     c.nonzero_duration(&format!("{k}.window"), f.window);
     c.nonzero_duration(&format!("{k}.base_backoff"), f.base_backoff);

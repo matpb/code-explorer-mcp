@@ -15,6 +15,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedSender;
 
 const KEY_PREFIX: &str = "cex_";
 const ID_LEN: usize = 8;
@@ -389,6 +390,21 @@ impl fmt::Display for AuthFailure {
 
 impl std::error::Error for AuthFailure {}
 
+/// Outcome of the cheap half of key verification.
+#[derive(Debug)]
+pub enum Precheck {
+    Verified(Arc<KeyEntry>),
+    NeedsHash(PendingVerify),
+}
+
+/// A key that passed every check except the argon2 comparison.
+#[derive(Debug)]
+pub struct PendingVerify {
+    entry: Arc<KeyEntry>,
+    digest: [u8; 32],
+    set: Arc<KeySet>,
+}
+
 #[derive(Debug)]
 struct CacheEntry {
     key_id: String,
@@ -424,32 +440,44 @@ impl KeyStore {
 
     /// Checks a presented key. Argon2 runs on a cache miss (tens of milliseconds), so call from a blocking context.
     pub fn verify(&self, presented: &str) -> Result<Arc<KeyEntry>, AuthFailure> {
+        match self.precheck(presented)? {
+            Precheck::Verified(entry) => Ok(entry),
+            Precheck::NeedsHash(pending) => self.complete(presented, pending),
+        }
+    }
+
+    /// Everything that needs no hashing: format, id, disabled and expiry, and the verified-key cache.
+    pub fn precheck(&self, presented: &str) -> Result<Precheck, AuthFailure> {
         let parsed = parse_key(presented).ok_or(AuthFailure::Malformed)?;
         let set = self.set.load_full();
         let entry = set.get(&parsed.id).ok_or(AuthFailure::UnknownId)?.clone();
-        let today = Utc::now().date_naive();
+        let entry = Self::check_state(entry, Utc::now().date_naive())?;
         let digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
 
-        let cached = {
-            let mut cache = lock(&self.cache);
-            match cache.get(&digest) {
-                Some(c) if c.verified_at.elapsed() < CACHE_TTL && c.key_id == entry.id => true,
-                Some(_) => {
-                    cache.remove(&digest);
-                    false
-                }
-                None => false,
+        let mut cache = lock(&self.cache);
+        match cache.get(&digest) {
+            Some(c) if c.verified_at.elapsed() < CACHE_TTL && c.key_id == entry.id => {
+                return Ok(Precheck::Verified(entry));
             }
-        };
-        if cached {
-            return Self::check_state(entry, today);
+            Some(_) => {
+                cache.remove(&digest);
+            }
+            None => {}
         }
+        Ok(Precheck::NeedsHash(PendingVerify { entry, digest, set }))
+    }
 
+    /// Runs argon2 for a key that passed `precheck` and caches the success. Blocking.
+    pub fn complete(
+        &self,
+        presented: &str,
+        pending: PendingVerify,
+    ) -> Result<Arc<KeyEntry>, AuthFailure> {
+        let PendingVerify { entry, digest, set } = pending;
         let parsed_hash = PasswordHash::new(&entry.hash).map_err(|_| AuthFailure::WrongSecret)?;
         Argon2::default()
             .verify_password(presented.as_bytes(), &parsed_hash)
             .map_err(|_| AuthFailure::WrongSecret)?;
-        let entry = Self::check_state(entry, today)?;
 
         if Arc::ptr_eq(&set, &self.set.load_full()) {
             lock(&self.cache).insert(
@@ -518,32 +546,21 @@ impl KeyStore {
     /// Spawns the file watcher (parent directory, 300ms debounce), a 2s mtime poll for bind mounts
     /// that inotify cannot see, and the SIGHUP listener; all call `reload`.
     pub fn watch(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
-        use notify::{RecursiveMode, Watcher};
+        self.watch_with(start_fs_watcher)
+    }
+
+    fn watch_with<W>(self: Arc<Self>, start_watcher: W) -> tokio::task::JoinHandle<()>
+    where
+        W: FnOnce(&Path, UnboundedSender<()>) -> notify::Result<Box<dyn Send>> + Send + 'static,
+    {
         use tokio::signal::unix::{SignalKind, signal};
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let file_name = self.path.file_name().map(|n| n.to_os_string());
-        let dir = match self.path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => PathBuf::from("."),
-        };
         tokio::spawn(async move {
-            let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-                if let Ok(ev) = res
-                    && !ev.kind.is_access()
-                    && ev
-                        .paths
-                        .iter()
-                        .any(|p| p.file_name() == file_name.as_deref())
-                {
-                    let _ = tx.send(());
-                }
-            })
-            .and_then(|mut w| w.watch(&dir, RecursiveMode::NonRecursive).map(|()| w));
-            let _watcher = match watcher {
+            let _watcher = match start_watcher(&self.path, tx.clone()) {
                 Ok(w) => Some(w),
                 Err(err) => {
-                    tracing::error!(error = %err, "keys file watcher failed to start, SIGHUP only");
+                    tracing::error!(error = %err, "keys file watcher failed to start, polling and SIGHUP only");
                     None
                 }
             };
@@ -558,10 +575,8 @@ impl KeyStore {
             let mut last_stamp = file_stamp(&self.path);
             loop {
                 tokio::select! {
-                    ev = rx.recv() => {
-                        if ev.is_none() {
-                            return;
-                        }
+                    // `tx` stays alive in this task, so `rx` never closes while the loop runs.
+                    Some(()) = rx.recv() => {
                         while let Ok(Some(())) = tokio::time::timeout(DEBOUNCE, rx.recv()).await {}
                         last_stamp = file_stamp(&self.path);
                         self.reload_and_log("file_change");
@@ -585,6 +600,30 @@ impl KeyStore {
             }
         })
     }
+}
+
+/// Starts the notify watcher on the keys file's parent directory; the handle keeps it alive.
+fn start_fs_watcher(path: &Path, tx: UnboundedSender<()>) -> notify::Result<Box<dyn Send>> {
+    use notify::{RecursiveMode, Watcher};
+
+    let file_name = path.file_name().map(|n| n.to_os_string());
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(ev) = res
+            && !ev.kind.is_access()
+            && ev
+                .paths
+                .iter()
+                .any(|p| p.file_name() == file_name.as_deref())
+        {
+            let _ = tx.send(());
+        }
+    })?;
+    watcher.watch(&dir, RecursiveMode::NonRecursive)?;
+    Ok(Box::new(watcher))
 }
 
 /// Generates a key and its stored entry. The plaintext key is shown once and never stored.
@@ -955,5 +994,29 @@ mod tests {
         }
         handle.abort();
         assert!(seen, "watcher did not reload the replaced file");
+    }
+
+    #[tokio::test]
+    async fn poll_reloads_when_the_watcher_fails_to_start() {
+        let (_dir, path) = tmp_keys("");
+        let store = KeyStore::new(path.clone(), vec![]).expect("loads");
+        let handle = store
+            .clone()
+            .watch_with(|_, _tx| Err(notify::Error::generic("injected watcher failure")));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (_, entry) = keygen("polled", None, None);
+        std::fs::write(&path, entry.to_toml_table()).expect("write");
+        let mut seen = false;
+        for _ in 0..80 {
+            if store.count() == 1 {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let alive = !handle.is_finished();
+        handle.abort();
+        assert!(alive, "reload task must survive a failed watcher");
+        assert!(seen, "poll did not reload after the watcher failed");
     }
 }
