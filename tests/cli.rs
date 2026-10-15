@@ -1,66 +1,14 @@
 //! End-to-end tests of the `code-explorer` binary against local bare repos.
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command as AssertCommand;
+use common::{ALLOW_LOCAL, BIN, ChildGuard, bare_repo, free_port, http, wait_for};
 use predicates::prelude::*;
-
-const BIN: &str = env!("CARGO_BIN_EXE_code-explorer");
-const ALLOW_LOCAL: &str = "CODE_EXPLORER_ALLOW_LOCAL_REMOTES";
-
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
-    l.local_addr().expect("addr").port()
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args([
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// Creates a bare repo with one commit holding `files` and returns its path.
-fn bare_repo(root: &Path, name: &str, files: &[(&str, &str)]) -> PathBuf {
-    let work = root.join(format!("{name}-work"));
-    std::fs::create_dir_all(&work).expect("mkdir");
-    git(&work, &["init", "-q", "-b", "main"]);
-    for (path, content) in files {
-        std::fs::write(work.join(path), content).expect("write file");
-    }
-    git(&work, &["add", "."]);
-    git(&work, &["commit", "-q", "-m", "initial commit"]);
-    let bare = root.join(format!("{name}.git"));
-    git(
-        root,
-        &[
-            "clone",
-            "-q",
-            "--bare",
-            work.to_str().expect("utf8"),
-            bare.to_str().expect("utf8"),
-        ],
-    );
-    bare
-}
 
 struct Fx {
     dir: tempfile::TempDir,
@@ -145,7 +93,7 @@ fn check_config_reports_a_typo_with_its_line() {
         .stderr(predicate::str::contains(
             "config.toml:3: listn: unknown field",
         ))
-        .stdout(predicate::str::contains("config has 1 problems"));
+        .stdout(predicate::str::contains("config has 1 problem(s)"));
 }
 
 #[test]
@@ -293,49 +241,6 @@ fn scan_flags_a_planted_secret_and_passes_a_clean_repo() {
         .code(2);
 }
 
-fn http(
-    port: u16,
-    method: &str,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: &str,
-) -> Option<(u16, String)> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
-    for (k, v) in headers {
-        req.push_str(&format!("{k}: {v}\r\n"));
-    }
-    req.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
-    stream.write_all(req.as_bytes()).ok()?;
-    let mut raw = String::new();
-    stream.read_to_string(&mut raw).ok()?;
-    let status = raw.split_whitespace().nth(1)?.parse().ok()?;
-    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_owned())?;
-    Some((status, body))
-}
-
-fn wait_for(what: &str, limit: Duration, mut ok: impl FnMut() -> bool) {
-    let start = Instant::now();
-    while start.elapsed() < limit {
-        if ok() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("timed out after {limit:?} waiting for {what}");
-}
-
-/// Kills the server if a test fails before the clean shutdown.
-struct Server(Child);
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 #[test]
 fn serve_runs_end_to_end_and_stops_on_sigterm() {
     let fx = Fx::empty();
@@ -362,7 +267,7 @@ fn serve_runs_end_to_end_and_stops_on_sigterm() {
         .spawn()
         .expect("spawn serve");
     let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid"));
-    let mut server = Server(child);
+    let mut server = ChildGuard(child);
 
     wait_for("/healthz", Duration::from_secs(30), || {
         http(fx.listen, "GET", "/healthz", &[], "").is_some_and(|(s, _)| s == 200)

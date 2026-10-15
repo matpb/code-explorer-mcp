@@ -25,9 +25,7 @@ services:
       DESIGN_SYSTEM_TOKEN: ${DESIGN_SYSTEM_TOKEN:-}
     ports:
       - "${EXPLORER_BIND:-127.0.0.1}:${EXPLORER_PORT:-8080}:8080"
-    networks:
-      edge:
-        ipv4_address: 172.30.0.10
+    networks: [edge]
 
   caddy:
     image: caddy:2@sha256:685ae3d7c34d9b5f8caeddc5d14051db7bbd88ff1f5a2fa0c16bd8ca328fb7af
@@ -43,17 +41,16 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
-    networks:
-      edge:
-        ipv4_address: 172.30.0.2
+    networks: [edge]
     depends_on:
       - explorer
 
 networks:
   edge:
+    # Must match server.trusted_proxies in config.toml. Change both if it overlaps a network you already have.
     ipam:
       config:
-        - subnet: 172.30.0.0/24
+        - subnet: ${EDGE_SUBNET:-172.30.0.0/24}
 
 volumes:
   explorer-data: {}

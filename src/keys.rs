@@ -21,6 +21,13 @@ const ID_LEN: usize = 8;
 const SECRET_LEN: usize = 43;
 const CACHE_TTL: Duration = Duration::from_secs(600);
 const DEBOUNCE: Duration = Duration::from_millis(300);
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Modification time and length of the keys file, or None when unreadable.
+fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
 const ARGON_M_KIB: u32 = 19456;
 const ARGON_T: u32 = 2;
 const ARGON_P: u32 = 1;
@@ -508,7 +515,8 @@ impl KeyStore {
         }
     }
 
-    /// Spawns the file watcher (parent directory, 300ms debounce) and the SIGHUP listener; both call `reload`.
+    /// Spawns the file watcher (parent directory, 300ms debounce), a 2s mtime poll for bind mounts
+    /// that inotify cannot see, and the SIGHUP listener; all call `reload`.
     pub fn watch(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         use notify::{RecursiveMode, Watcher};
         use tokio::signal::unix::{SignalKind, signal};
@@ -546,6 +554,8 @@ impl KeyStore {
                     None
                 }
             };
+            let mut poll = tokio::time::interval(POLL_INTERVAL);
+            let mut last_stamp = file_stamp(&self.path);
             loop {
                 tokio::select! {
                     ev = rx.recv() => {
@@ -553,7 +563,15 @@ impl KeyStore {
                             return;
                         }
                         while let Ok(Some(())) = tokio::time::timeout(DEBOUNCE, rx.recv()).await {}
+                        last_stamp = file_stamp(&self.path);
                         self.reload_and_log("file_change");
+                    }
+                    _ = poll.tick() => {
+                        let stamp = file_stamp(&self.path);
+                        if stamp != last_stamp {
+                            last_stamp = stamp;
+                            self.reload_and_log("poll");
+                        }
                     }
                     _ = async {
                         match hup.as_mut() {

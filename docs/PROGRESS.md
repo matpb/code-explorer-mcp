@@ -29,7 +29,7 @@ Checklist for the v1 build. Kept current so a restart loses nothing. Spec: the o
 - [x] per-key `list_tools` with repo enums
 - [x] `http`: public /mcp + /healthz with Origin check, body limit, timeouts; admin /readyz + /metrics
 - [x] `metrics`, `logging` (JSON tool_call events, shape vs full)
-- [ ] CLI: serve, check-config [--probe], keygen, scan --repo, status, healthcheck, askpass (hidden)
+- [x] CLI: serve, check-config [--probe], keygen, scan --repo, status, healthcheck, askpass (hidden)
 
 ## Phase 4: integration tests
 - [ ] Fixture builder: local bare repos with known content, a planted fake secret, a symlink, a binary, a large file, denied paths
@@ -39,10 +39,10 @@ Checklist for the v1 build. Kept current so a restart loses nothing. Spec: the o
 - [ ] Scan policies: redact masks, block holds, warn serves
 
 ## Phase 5: packaging
-- [ ] Dockerfile (multi-stage, non-root, pinned gitleaks with checksum, healthcheck via binary)
-- [ ] deploy/compose.yaml with caddy profile, Caddyfile, .env.example
+- [x] Dockerfile (multi-stage, non-root, pinned gitleaks with checksum, healthcheck via binary)
+- [x] deploy/compose.yaml with caddy profile, Caddyfile, .env.example
 - [ ] Both profiles up locally and answered by a real MCP client script
-- [ ] known_hosts for github.com and bitbucket.org
+- [x] known_hosts for github.com and bitbucket.org
 
 ## Phase 6: docs and CI
 - [ ] README, CHANGELOG, LICENSE, SECURITY.md, config.example.toml, keys.example.toml
