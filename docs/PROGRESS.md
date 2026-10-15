@@ -25,9 +25,9 @@ Checklist for the v1 build. Kept current so a restart loses nothing. Spec: the o
 - [x] Unit tests
 
 ## Phase 3: tools, HTTP, metrics, logging, CLI
-- [ ] `tools`: list_repos, list_tree, glob, read_file, grep, log (+ blame, file at commit behind features), envelope, notices, typed errors, text rendering, output caps, permalinks
-- [ ] per-key `list_tools` with repo enums
-- [ ] `http`: public /mcp + /healthz with Origin check, body limit, timeouts; admin /readyz + /metrics
+- [x] `tools`: list_repos, list_tree, glob, read_file, grep, log (+ blame, file at commit behind features), envelope, notices, typed errors, text rendering, output caps, permalinks
+- [x] per-key `list_tools` with repo enums
+- [x] `http`: public /mcp + /healthz with Origin check, body limit, timeouts; admin /readyz + /metrics
 - [x] `metrics`, `logging` (JSON tool_call events, shape vs full)
 - [ ] CLI: serve, check-config [--probe], keygen, scan --repo, status, healthcheck, askpass (hidden)
 
