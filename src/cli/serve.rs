@@ -111,6 +111,7 @@ pub(super) async fn run(config_path: &Path, log_format: Option<LogFormat>) -> u8
         scanner,
         creds,
         cancel: cancel.clone(),
+        metrics: Some(metrics.clone()),
     });
 
     let throttle = Arc::new(Throttle::new(&cfg.auth.failed_attempts));

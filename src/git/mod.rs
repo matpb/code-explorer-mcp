@@ -684,6 +684,17 @@ impl GitRunner {
         Ok(self.exec_local(cmd, "cat-file").await?.stdout)
     }
 
+    /// Size in bytes of the blob at `path` in commit `oid`, without reading its content.
+    pub async fn blob_size(&self, repo_dir: &Path, oid: &Oid, path: &str) -> Result<u64, GitError> {
+        let mut cmd = self.repo_cmd(repo_dir);
+        cmd.args(["cat-file", "-s"]).arg(format!("{oid}:{path}"));
+        let out = self.exec_local(cmd, "cat-file").await?;
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .map_err(|_| GitError::Parse("cat-file -s printed no size".into()))
+    }
+
     /// True when `oid` is a commit present in the clone and an ancestor of `refs/heads/<branch>`.
     pub async fn commit_in_history(
         &self,
@@ -712,9 +723,11 @@ impl GitRunner {
         }
     }
 
+    /// Blames `path` in the worktree, or in `commit` when given (the worktree may be rewritten).
     pub async fn blame(
         &self,
         worktree_dir: &Path,
+        commit: Option<&Oid>,
         path: &str,
         start: u32,
         end: u32,
@@ -724,9 +737,11 @@ impl GitRunner {
         }
         let mut cmd = self.repo_cmd(worktree_dir);
         cmd.args(["blame", "--porcelain", "-L"])
-            .arg(format!("{start},{end}"))
-            .arg("--")
-            .arg(path);
+            .arg(format!("{start},{end}"));
+        if let Some(commit) = commit {
+            cmd.arg(commit.as_str());
+        }
+        cmd.arg("--").arg(path);
         let out = self.exec_local(cmd, "blame").await?;
         parse_blame(&out.stdout)
     }
@@ -1137,14 +1152,21 @@ mod tests {
 
         let wt = tmp.path().join("wt");
         git.worktree_add(&bare, &tip, &wt).await.unwrap();
-        let lines = git.blame(&wt, "a.txt", 1, 2).await.unwrap();
+        let lines = git.blame(&wt, None, "a.txt", 1, 2).await.unwrap();
         assert_eq!(lines.len(), 2);
         assert_eq!((lines[0].line, lines[0].text.as_str()), (1, "one"));
         assert_eq!((lines[1].line, lines[1].text.as_str()), (2, "two"));
         assert_eq!(lines[0].author_name, "Ada Tester");
         assert_ne!(lines[0].oid, lines[1].oid);
         assert!(lines[0].boundary && !lines[1].boundary);
-        assert!(git.blame(&wt, "a.txt", 0, 2).await.is_err());
+        assert!(git.blame(&wt, None, "a.txt", 0, 2).await.is_err());
+        assert_eq!(git.blob_size(&bare, &tip, "a.txt").await.unwrap(), 8);
+        assert!(git.blob_size(&bare, &tip, "missing.txt").await.is_err());
+
+        std::fs::write(wt.join("a.txt"), "ONE\nTWO\n").unwrap();
+        let at = git.blame(&wt, Some(&tip), "a.txt", 1, 2).await.unwrap();
+        assert_eq!(at[0].text, "one");
+        assert_eq!(at[0].oid, lines[0].oid);
 
         let msgs = git.commit_messages(&bare, &tip, 10).await.unwrap();
         assert!(msgs.contains("first commit") && msgs.contains("with a body"));
@@ -1157,7 +1179,7 @@ mod tests {
         };
         let wt = tmp.path().join("wt");
         git.worktree_add(&bare, &tip, &wt).await.unwrap();
-        let lines = git.blame(&wt, "a.txt", 1, 2).await.unwrap();
+        let lines = git.blame(&wt, None, "a.txt", 1, 2).await.unwrap();
         assert_eq!(lines.len(), 2);
         assert!(lines.iter().all(|l| l.boundary));
     }

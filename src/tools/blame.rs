@@ -1,4 +1,4 @@
-//! `blame`: per-line attribution within the kept history (optional feature).
+//! `blame`: per-line attribution of the snapshot commit within the kept history (optional feature).
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -113,8 +113,12 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
             ));
         }
     }
-    let _permit = ex.workers.acquire().await.map_err(|_| ToolError::busy())?;
-    let blamed = match ex.git.blame(&snap.root, path.as_str(), start, end).await {
+    let _permit = ex.acquire_worker().await?;
+    let blamed = match ex
+        .git
+        .blame(&snap.root, Some(&snap.commit), path.as_str(), start, end)
+        .await
+    {
         Ok(lines) => lines,
         Err(GitError::Failed {
             stderr_scrubbed, ..
@@ -182,7 +186,8 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
         ));
     }
     notices.push_opt(stale_notice(&ex.cfg, &state));
-    notices.push_opt(red.notice());
+    let on_disk = usize::from(snap.index.is_redacted(&path));
+    notices.push_opt(red.notice_plus(on_disk));
 
     let mut text = format!(
         "{}@{} blame {} lines {}-{}\n",

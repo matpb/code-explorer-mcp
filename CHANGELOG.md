@@ -14,3 +14,4 @@ All notable changes to this project are documented here. The format follows Keep
 - gitleaks scanning on onboarding and every pull with `redact`, `warn` and `block` policies, plus a path deny-list.
 - JSON request logs per key, `/healthz`, `/readyz`, Prometheus metrics.
 - Docker image and compose files with a Caddy profile and a gateway mode.
+- Redaction at rest: under the `redact` policy, found secret values are replaced inside the snapshot files before anything is served.

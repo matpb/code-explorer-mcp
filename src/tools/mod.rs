@@ -76,7 +76,8 @@ fn input_schema<P: JsonSchema + Any>() -> Arc<JsonObject> {
     schema_for_input::<P>().unwrap_or_else(|_| schema_for_empty_input())
 }
 
-/// Output schema with the `notices` array every result carries.
+/// Output schema with the `notices` array every result carries; nothing is `required`
+/// at the top level because error results carry only `error`.
 fn output_schema<O: JsonSchema + Any>() -> Arc<JsonObject> {
     let mut schema = (*schema_for_output::<O>()).clone();
     let notice = json!({
@@ -87,12 +88,7 @@ fn output_schema<O: JsonSchema + Any>() -> Arc<JsonObject> {
     if let Some(Value::Object(props)) = schema.get_mut("properties") {
         props.insert("notices".into(), json!({"type": "array", "items": notice}));
     }
-    match schema.get_mut("required") {
-        Some(Value::Array(req)) => req.push(json!("notices")),
-        _ => {
-            schema.insert("required".into(), json!(["notices"]));
-        }
-    }
+    schema.remove("required");
     Arc::new(schema)
 }
 
@@ -311,6 +307,14 @@ impl Explorer {
         } else {
             Ok(())
         }
+    }
+
+    /// Takes a worker slot, counting a rejection when none frees up in time.
+    pub(crate) async fn acquire_worker(&self) -> Result<crate::proc::Permit, ToolError> {
+        self.workers.acquire().await.map_err(|_| {
+            self.metrics.queue_rejection();
+            ToolError::busy()
+        })
     }
 
     pub(crate) fn rg_timeout_message(&self) -> String {

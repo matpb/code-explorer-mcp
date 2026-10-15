@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, RepoConfig};
 use crate::git::{self, Oid, TreeKind};
-use crate::paths::{PathError, RepoPath};
+use crate::paths::RepoPath;
 use crate::redact::Redactor;
 use crate::scan::Finding;
 
@@ -75,7 +75,7 @@ pub struct FileIndex {
 
 impl FileIndex {
     /// Entries whose path fails `RepoPath::parse` are skipped with a warning.
-    pub fn from_git(list: Vec<git::TreeEntry>) -> Result<FileIndex, PathError> {
+    pub fn from_git(list: Vec<git::TreeEntry>) -> FileIndex {
         let mut entries = Vec::with_capacity(list.len());
         for e in list {
             let kind = match e.kind {
@@ -96,7 +96,7 @@ impl FileIndex {
                 }
             }
         }
-        Ok(Self::from_entries(entries))
+        Self::from_entries(entries)
     }
 
     pub fn from_entries(list: Vec<TreeEntry>) -> FileIndex {
@@ -808,7 +808,6 @@ mod tests {
             gt("vendor/lib", TreeKind::Submodule, None),
             gt("docs/a.md", TreeKind::Blob, Some(1)),
         ])
-        .unwrap()
     }
 
     fn tmp_snapshot(root: PathBuf) -> Snapshot {
@@ -897,8 +896,7 @@ mod tests {
             gt("a/.git/config", TreeKind::Blob, Some(1)),
             gt("a/../b", TreeKind::Blob, Some(1)),
             gt("dir", TreeKind::Tree, None),
-        ])
-        .unwrap();
+        ]);
         assert_eq!(idx.len(), 1);
         assert!(idx.get(&rp("ok.txt")).is_some());
         assert!(!idx.is_dir(&rp("dir")));

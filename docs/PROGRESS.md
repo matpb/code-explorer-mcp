@@ -46,16 +46,16 @@ Checklist for the v1 build. Kept current so a restart loses nothing. Spec: the o
 
 ## Phase 6: docs and CI
 - [x] README, CHANGELOG, LICENSE, SECURITY.md, config.example.toml, keys.example.toml
-- [x] .github/workflows/ci.yml: fmt, clippy, test, docker build
+- [x] scripts/check.sh replaces GitHub CI (owner preference): fmt, clippy, test, audit, deny, gitleaks
 
 ## Phase 7: reviews
-- [ ] Correctness review (fresh subagent, diff + spec)
-- [ ] Security review (fresh subagent, diff + spec)
-- [ ] /code-review
-- [ ] Fixes applied, proof re-run, docs/REVIEW.md written
+- [x] Correctness review (fresh subagent, diff + spec)
+- [x] Security review (fresh subagent, diff + spec)
+- [x] /code-review
+- [x] Fixes applied, proof re-run, docs/REVIEW.md written
 
 ## Phase 8: leak scan and publish
 - [ ] gitleaks over the tree and the full history
 - [ ] grep for personal data, hostnames, IPs, local paths, machine names, client names
-- [ ] `gh repo create matpb/code-explorer-mcp --public`, push, CI green
+- [ ] `gh repo create matpb/code-explorer-mcp --public`, push, local check script green
 - [ ] Final crew_notify to Mat and summary to cortex

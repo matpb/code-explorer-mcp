@@ -105,7 +105,7 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
         let repo_dir = ex.repo_dir(&p.repo);
         let short = &rev[..rev.len().min(7)];
         let history_err = || ToolError::history_unavailable(ex.cfg.pull.depth, short);
-        let _permit = ex.workers.acquire().await.map_err(|_| ToolError::busy())?;
+        let _permit = ex.acquire_worker().await?;
         let oid = match ex.git.rev_parse(&repo_dir, rev).await {
             Ok(oid) => oid,
             Err(crate::git::GitError::Failed { .. }) => return Err(history_err()),
@@ -119,25 +119,31 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
         if !in_history {
             return Err(history_err());
         }
+        let not_found = || ToolError::path_not_found(path.as_str(), &p.repo, oid.short(), &[]);
+        let blob_size = match ex.git.blob_size(&repo_dir, &oid, path.as_str()).await {
+            Ok(n) => n,
+            Err(crate::git::GitError::Failed { .. }) => return Err(not_found()),
+            Err(e) => return Err(ex.map_git(e, "git")),
+        };
+        if blob_size > max_bytes {
+            return Err(ToolError::file_too_large(
+                path.as_str(),
+                blob_size,
+                max_bytes,
+            ));
+        }
         let data = match ex.git.show_file(&repo_dir, &oid, path.as_str()).await {
             Ok(d) => d,
-            Err(crate::git::GitError::Failed { .. }) => {
-                return Err(ToolError::path_not_found(
+            Err(crate::git::GitError::Failed { .. }) => return Err(not_found()),
+            Err(crate::git::GitError::OutputTooLarge) => {
+                return Err(ToolError::file_too_large(
                     path.as_str(),
-                    &p.repo,
-                    oid.short(),
-                    &[],
+                    blob_size,
+                    max_bytes,
                 ));
             }
             Err(e) => return Err(ex.map_git(e, "git")),
         };
-        if data.len() as u64 > max_bytes {
-            return Err(ToolError::file_too_large(
-                path.as_str(),
-                data.len() as u64,
-                max_bytes,
-            ));
-        }
         let meta = ex
             .git
             .commit_meta(&repo_dir, &oid)
@@ -201,7 +207,9 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
     if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
         return Err(ToolError::binary_file(path.as_str(), size));
     }
-    let text = String::from_utf8_lossy(&bytes);
+    let mut red = Redaction::new(&snap.redactor);
+    let raw_text = String::from_utf8_lossy(&bytes);
+    let text = red.apply(&raw_text);
     let all_lines = split_lines(&text);
     let total = all_lines.len();
     let offset = p.offset as usize;
@@ -211,7 +219,6 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
     let from = offset - 1;
     let to = (from + p.limit as usize).min(total);
 
-    let mut red = Redaction::new(&snap.redactor);
     let mut cut_any = false;
     let mut lines: Vec<String> = all_lines[from..to]
         .iter()
@@ -262,7 +269,8 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
         ));
     }
     notices.push_opt(stale_notice(&ex.cfg, &state));
-    notices.push_opt(red.notice());
+    let on_disk = usize::from(p.commit.is_none() && snap.index.is_redacted(&path));
+    notices.push_opt(red.notice_plus(on_disk));
 
     let end_line = if lines.is_empty() {
         offset - 1

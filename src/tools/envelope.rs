@@ -45,7 +45,7 @@ impl Source {
             branch: state.cfg.branch.clone(),
             commit: snap.commit.to_string(),
             commit_time: rfc3339(snap.commit_time),
-            pulled_at: rfc3339(snap.pulled_at),
+            pulled_at: rfc3339(state.status().last_success.unwrap_or(snap.pulled_at)),
             stale,
         }
     }
@@ -93,7 +93,9 @@ impl Notice {
     pub fn secrets_redacted(count: usize) -> Notice {
         Notice::new(
             "secrets_redacted",
-            format!("{count} value(s) in this result were masked as [REDACTED:rule-id]."),
+            format!(
+                "Secret values in this result were masked as [REDACTED:rule-id] ({count} place(s))."
+            ),
         )
     }
 
@@ -165,7 +167,13 @@ impl<'a> Redaction<'a> {
     }
 
     pub fn notice(&self) -> Option<Notice> {
-        (self.hits > 0).then(|| Notice::secrets_redacted(self.hits))
+        self.notice_plus(0)
+    }
+
+    /// The `secrets_redacted` notice for these hits plus `extra` places masked on disk.
+    pub fn notice_plus(&self, extra: usize) -> Option<Notice> {
+        let n = self.hits + extra;
+        (n > 0).then(|| Notice::secrets_redacted(n))
     }
 }
 

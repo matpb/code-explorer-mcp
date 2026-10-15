@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, Credential, OnScanError, ScanPolicy};
 use crate::git::{self, CredentialFiles, GitError, GitRunner, Oid, ResolvedCredential};
+use crate::metrics::Metrics;
 use crate::paths::RepoPath;
 use crate::proc;
 use crate::redact::Redactor;
@@ -82,6 +83,7 @@ pub struct PullerDeps {
     pub scanner: Arc<dyn Scanner>,
     pub creds: Arc<ResolvedCreds>,
     pub cancel: CancellationToken,
+    pub metrics: Option<Arc<Metrics>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,7 +230,7 @@ async fn try_restore(
         return None;
     }
     let tree = deps.git.ls_tree(&dirs.git, &sf.commit).await.ok()?;
-    let index = FileIndex::from_git(tree).ok()?;
+    let index = FileIndex::from_git(tree);
     let root = sf.worktree.clone();
     let max = cfg.limits.max_file_bytes;
     let rewritten = sf.rewritten_files.clone();
@@ -349,8 +351,18 @@ pub async fn pull_once(
         ),
     }
     match &result {
-        Ok(_) => state.record_success(),
-        Err(e) => state.record_failure(e.clone()),
+        Ok(_) => {
+            state.record_success();
+            if let Some(m) = &deps.metrics {
+                m.repo_success(&state.cfg.id, Utc::now().timestamp());
+            }
+        }
+        Err(e) => {
+            state.record_failure(e.clone());
+            if let Some(m) = &deps.metrics {
+                m.repo_pull_failure(&state.cfg.id, e.class.as_str());
+            }
+        }
     }
     result
 }
@@ -598,7 +610,7 @@ async fn prepare_snapshot(
     inputs: &ScanInputs,
 ) -> Result<Built, PullError> {
     let tree = deps.git.ls_tree(&dirs.git, tip).await.map_err(git_err)?;
-    let index = FileIndex::from_git(tree).map_err(|e| internal(e.to_string()))?;
+    let index = FileIndex::from_git(tree);
     let meta = deps
         .git
         .commit_meta(&dirs.git, tip)
@@ -913,6 +925,7 @@ mod tests {
             scanner,
             creds,
             cancel: CancellationToken::new(),
+            metrics: None,
         };
         (deps, state)
     }

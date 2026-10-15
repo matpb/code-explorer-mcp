@@ -12,11 +12,11 @@ A read-only [MCP](https://modelcontextprotocol.io) server that lets AI agents ex
 
 | Tool | What it does |
 |---|---|
-| `list_repos` | The repos this key may see, with description, branch, commit, freshness and status. |
+| `list_repos` | The repos this key may see, with description, branch, commit, freshness and status. `secrets_redacted` counts the values masked in served content (0 unless the `redact` policy applies) and `secret_findings` counts what the scanner found under any policy. |
 | `list_tree` | Directory listing from a path, breadth-first to a depth, from the in-memory index. |
 | `glob` | Find files by gitignore-style pattern (`src/**/*.tsx`). |
 | `read_file` | Exact text of a line range, with a permalink to the host at that commit. |
-| `grep` | ripgrep across one or many repos: regex or literal, globs, file types, context lines. |
+| `grep` | ripgrep across one or many repos: regex or literal, globs, file types, context lines. Each match carries `before` and `after` arrays of `{line, text}` objects; a neighboring match is context of the match next to it. A repo that cannot get a worker slot is listed in `repos_skipped` with reason `busy`. |
 | `log` | Recent commits, optionally for one path, with changed files. |
 | `blame` | Optional, off by default. Line attribution within the kept history. |
 
@@ -31,11 +31,11 @@ Requirements on the host: Docker with Compose, a DNS name pointing at the host (
 ```sh
 git clone https://github.com/matpb/code-explorer-mcp.git
 cd code-explorer-mcp/deploy
-cp .env.example .env            # set DOMAIN; change EDGE_SUBNET if 172.30.0.0/24 is taken on this host
+cp .env.example .env            # set DOMAIN; change EDGE_SUBNET and CADDY_IP if 172.30.0.0/24 is taken on this host
 cp ../config.example.toml config.toml
 mkdir -p secrets && touch keys.toml
 # put each repo's SSH private key (or token) in secrets/, see "Onboarding a repo"
-$EDITOR config.toml             # server.trusted_proxies must match EDGE_SUBNET
+$EDITOR config.toml             # server.trusted_proxies must be Caddy's address (CADDY_IP as a /32)
 docker compose build
 docker compose run --rm explorer check-config --probe
 docker compose run --rm explorer keygen --name my-agent --print-only >> keys.toml
@@ -75,9 +75,10 @@ Two TOML files, both server-side and never committed:
 | `server.admin_listen` | `0.0.0.0:9090` | `/readyz` and `/metrics`. Never publish this port. |
 | `server.public_url` | | The URL clients use. Informational. |
 | `server.allowed_origins` | `[]` | Browser origins allowed. A present `Origin` not listed gets 403. |
-| `server.trusted_proxies` | `["172.30.0.0/24"]` | Only these peers may set the client IP header. |
+| `server.trusted_proxies` | `[]` | Only these peers may set the client IP header. In the compose setup this is Caddy's fixed address, `172.30.0.2/32`. Never a whole Docker subnet: its gateway address is how host-local clients appear. |
 | `server.client_ip_header` | `X-Forwarded-For` | Header the proxy sets. Empty string disables it. |
 | `server.data_dir` | `/data` | Clones and snapshots. A cache: safe to delete. |
+| `server.max_connections` | `1024` | Open connections on the public listener. Beyond it, new connections are closed at once. Idle connections close after 60 s. |
 
 ### Auth and throttling
 
@@ -88,6 +89,7 @@ Two TOML files, both server-side and never committed:
 | `auth.failed_attempts.window` | `10m` | |
 | `auth.failed_attempts.base_backoff` | `2s` | Doubles per further failure, up to `max_backoff` (`15m`). |
 | `auth.failed_attempts.ipv6_prefix` | `64` | IPv6 clients are grouped by prefix. |
+| `auth.max_concurrent_verifications` | `4` | argon2 verifications in flight. Beyond it a request waits 2 s, then gets 503 with `Retry-After`. Cached keys never need a slot. |
 
 Authenticated traffic is never rate limited. A global worker cap bounds subprocesses for everyone at once.
 
@@ -121,14 +123,14 @@ Authenticated traffic is never rate limited. A global worker cap bounds subproce
 | `scan.on_scan_error` | `hold` | `hold` keeps the previous snapshot when the scanner fails; `serve` swaps with a warning. |
 | `scan.allowlist` | `[]` | gitleaks fingerprints judged false positives. |
 | `deny.use_defaults` | `true` | Built-in list below. |
-| `deny.paths`, `deny.allow` | `[]` | Extra globs and exceptions, matched case-insensitively. |
+| `deny.paths`, `deny.allow` | `[]` | Extra globs and exceptions, matched case-insensitively. A pattern without a `/` matches at any depth, like `.gitignore`. |
 | `features.file_at_commit`, `features.blame` | `false` | Optional tools. |
 | `logging.format` | `json` | Or `pretty`. |
 | `logging.arguments` | `shape` | `shape` logs paths and sizes and hashes grep patterns; `full` logs patterns. |
 | `logging.author_emails` | `false` | `log` returns author names only unless true. |
 | `metrics.enabled` | `true` | Prometheus text on the admin listener. |
 
-Built-in deny-list: `.git/**`, `**/.env`, `**/.env.*`, `**/*.pem`, `**/*.key`, `**/*.p12`, `**/*.pfx`, `**/*.jks`, `**/*.keystore`, `**/id_rsa*`, `**/id_ed25519*`, `**/.npmrc`, `**/.pypirc`, `**/.netrc`, `**/*.tfstate`, `**/*.tfstate.*`, `**/credentials*.json`, `**/secrets.*`. Templates such as `.env.example` are denied too; carve exceptions with `deny.allow`.
+Built-in deny-list: `.git/**`, `**/.env`, `**/.env.*`, `**/*.pem`, `**/*.key`, `**/*.p12`, `**/*.pfx`, `**/*.jks`, `**/*.keystore`, `**/id_rsa*`, `**/id_ed25519*`, `**/.npmrc`, `**/.pypirc`, `**/.netrc`, `**/*.tfstate`, `**/*.tfstate.*`, `**/credentials*.json`, `**/secrets.*`, `**/id_ecdsa*`, `**/id_dsa*`, `**/*.p8`, `**/.htpasswd`, `**/.git-credentials`, `**/.docker/config.json`, `**/kubeconfig*`, `**/*.kdbx`, `**/*.gpg`, `**/service-account*.json`. Templates such as `.env.example` are denied too; carve exceptions with `deny.allow`.
 
 ### Credentials and repos
 
@@ -176,10 +178,10 @@ Credentials are referenced by name and resolved from a secret file or an environ
 Trust boundaries: clients are authenticated but semi-trusted (an agent can be steered by what it reads), repository content is untrusted data, the hosts are trusted for transport only, the operator and the config files are trusted.
 
 - **Keys** are stored only as argon2id hashes. A stolen `keys.toml` grants nothing. Keys carry 256 random bits and a `cex_` prefix that secret scanners can match.
-- **Failed authentication** is throttled per client IP with exponential backoff. Blocked requests get 429 and no key is checked. The client IP header is honored only from `trusted_proxies`.
+- **Failed authentication** is throttled per client IP with exponential backoff. Blocked requests get 429 and no key is checked. Unknown ids, disabled and expired keys are rejected before any hashing, and argon2 verifications are bounded, so a flood of bad keys cannot exhaust memory. The client IP header is honored only from `trusted_proxies`.
 - **Path traversal**: paths are normalized and checked against the in-memory file index before any disk access, then resolved beneath the snapshot root. `.git` and `..` are rejected outright.
 - **Symlinks**: checkouts use `core.symlinks=false`, so links become small plain files holding the link text. ripgrep never follows links.
-- **Secrets in repos**: gitleaks scans every new snapshot with the server's own ruleset (a repo cannot ship a `.gitleaks.toml` or `gitleaks:allow` comment to hide findings). Found values are masked as `[REDACTED:<rule>]` in every result, or the snapshot is held under the `block` policy. The server cannot remove a secret from history: rotate it at the source.
+- **Secrets in repos**: gitleaks scans every new snapshot with the server's own ruleset (a repo cannot ship a `.gitleaks.toml` or `gitleaks:allow` comment to hide findings, and the default path allowlist is disabled so `node_modules`, images and lock files are scanned too). Under the `redact` policy the found values are replaced in the snapshot files themselves before anything is served, so `grep` cannot be used to guess a value by bisection, and an in-memory matcher masks them again in commit messages and anything not on disk. Under `block` the snapshot is held. With `file_at_commit` on, the kept history is scanned as well. The server cannot remove a secret from Git history: rotate it at the source.
 - **Credentials** reach git through an askpass helper or `GIT_SSH_COMMAND`, never a URL, an argument or `.git/config`. Git stderr is scrubbed before it is logged.
 - **Subprocesses** run with a cleared environment, hooks disabled, LFS smudge off, protocols limited to https and ssh, each in its own process group with a timeout and a kill on expiry, under a global concurrency cap.
 - **Regex**: ripgrep's default linear-time engine only, size limits on the compiled regex, pattern length caps.
@@ -223,6 +225,7 @@ Upgrading: read the release notes, pull the new image, run `docker compose run -
 |---|---|
 | `check-config` lists problems | Each line names the file, line and key. Fix them all; the server refuses to start otherwise. |
 | `/readyz` stays 503 | A first clone is still running or failing. The body shows `last_error` per repo: `auth` means the credential is wrong or lacks access, `network` means the host is unreachable or the path is wrong. |
+| 503 `busy` from `/mcp` | More than `auth.max_concurrent_verifications` uncached keys are being verified at once. Legitimate clients are cached after their first call, so this means a flood of bad keys. |
 | `repo_not_ready` in tool results | Same as above, from the client's side. Retry after the clone finishes. |
 | `stale_snapshot` notices | Pulls have failed for longer than `pull.stale_after`. The notice carries the error class. Check `status`. |
 | A repo is `scan_held` | Policy `block` found a secret. Rotate it, or allowlist the fingerprint if it is a false positive, then wait for the next pull. |
@@ -237,12 +240,10 @@ Upgrading: read the release notes, pull the new image, run `docker compose run -
 ## Development
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+scripts/check.sh
 ```
 
-Tests build real local Git repositories as fixtures and need `git`, `rg` and `gitleaks` on `PATH`. The integration suite starts the server on ephemeral ports and drives it with a real MCP client. See `docs/ARCHITECTURE.md` for the module layout and `docs/DECISIONS.md` for the design choices.
+That runs `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`, `cargo audit`, `cargo deny` (advisories and licenses) and gitleaks over the tree and the full history. Tests build real local Git repositories as fixtures and need `git`, `rg` and `gitleaks` on `PATH`. The integration suite starts the server on ephemeral ports and drives it with a real MCP client. See `docs/ARCHITECTURE.md` for the module layout, `docs/DECISIONS.md` for the design choices and `docs/REVIEW.md` for the review findings and their outcomes.
 
 ## License
 

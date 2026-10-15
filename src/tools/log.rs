@@ -117,7 +117,7 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
     let (commits, history_truncated) = if in_future {
         (Vec::new(), false)
     } else {
-        let _permit = ex.workers.acquire().await.map_err(|_| ToolError::busy())?;
+        let _permit = ex.acquire_worker().await?;
         ex.git
             .log(&ex.repo_dir(&p.repo), &snap.commit, &query)
             .await

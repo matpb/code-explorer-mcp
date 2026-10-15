@@ -20,6 +20,8 @@ pub const ALLOW_LOCAL: &str = "CODE_EXPLORER_ALLOW_LOCAL_REMOTES";
 pub const BUTTON_MARKER: &str = "BUTTON_MARKER";
 pub const OTHER_MARKER: &str = "OTHER_MARKER";
 pub const ENV_SECRET: &str = "should-never-appear";
+/// Present only in `.ENV` and `Secrets.yaml`, which the default deny-list blocks in any letter case.
+pub const CASE_NEEDLE: &str = "CASE_VARIANT_NEEDLE";
 pub const SUBJECTS: [&str; 3] = [
     "Add README and Button component",
     "Add assets, config and bulk entries",
@@ -195,6 +197,15 @@ impl Upstream {
         put(
             "src/components/Button.tsx",
             button_source("NEW_LABEL").as_bytes(),
+        );
+        put(".ENV", format!("{CASE_NEEDLE}=1\n").as_bytes());
+        put(
+            "Secrets.yaml",
+            format!("needle: {CASE_NEEDLE}\n").as_bytes(),
+        );
+        put(
+            "docs/adjacent.txt",
+            b"intro\nADJ_HIT first\nADJ_HIT second\noutro\n",
         );
         git(&work, &["add", "."]);
         git(&work, &["commit", "-q", "-m", SUBJECTS[2]]);

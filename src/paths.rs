@@ -26,6 +26,16 @@ pub const DEFAULT_DENY: &[&str] = &[
     "**/*.tfstate.*",
     "**/credentials*.json",
     "**/secrets.*",
+    "**/id_ecdsa*",
+    "**/id_dsa*",
+    "**/*.p8",
+    "**/.htpasswd",
+    "**/.git-credentials",
+    "**/.docker/config.json",
+    "**/kubeconfig*",
+    "**/*.kdbx",
+    "**/*.gpg",
+    "**/service-account*.json",
 ];
 
 /// Why a client-supplied path was rejected.
@@ -156,10 +166,14 @@ pub struct DenyList {
     deny: GlobSet,
     allow: GlobSet,
     deny_patterns: Vec<String>,
+    has_allow: bool,
 }
 
-/// Expands `**/x` to also match `x` at the root.
+/// Expands `**/x` to also match `x` at the root; a pattern without `/` matches at any depth, like gitignore.
 fn with_root_form(pattern: &str) -> Vec<String> {
+    if !pattern.contains('/') {
+        return vec![format!("**/{pattern}"), pattern.to_string()];
+    }
     let mut out = vec![pattern.to_string()];
     if let Some(rest) = pattern.strip_prefix("**/")
         && !rest.is_empty()
@@ -169,15 +183,16 @@ fn with_root_form(pattern: &str) -> Vec<String> {
     out
 }
 
-fn build_set(patterns: &[String]) -> Result<GlobSet, PatternError> {
+/// Compiles each pattern; a failure names the pattern as the operator wrote it.
+fn build_set(patterns: &[(String, String)]) -> Result<GlobSet, PatternError> {
     let mut builder = GlobSetBuilder::new();
-    for p in patterns {
+    for (p, original) in patterns {
         let glob = GlobBuilder::new(p)
             .case_insensitive(true)
             .literal_separator(true)
             .build()
             .map_err(|e| PatternError {
-                pattern: p.clone(),
+                pattern: original.clone(),
                 message: e.kind().to_string(),
             })?;
         builder.add(glob);
@@ -188,12 +203,13 @@ fn build_set(patterns: &[String]) -> Result<GlobSet, PatternError> {
     })
 }
 
-fn expand(patterns: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// Expanded patterns paired with the pattern they came from, without duplicates.
+fn expand(patterns: impl IntoIterator<Item = String>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
     for p in patterns {
         for form in with_root_form(&p) {
-            if !out.contains(&form) {
-                out.push(form);
+            if !out.iter().any(|(f, _)| *f == form) {
+                out.push((form, p.clone()));
             }
         }
     }
@@ -212,12 +228,13 @@ impl DenyList {
             raw.extend(DEFAULT_DENY.iter().map(|s| s.to_string()));
         }
         raw.extend(extra.iter().cloned());
-        let deny_patterns = expand(raw);
-        let allow_patterns = expand(allow.iter().cloned());
+        let deny_pairs = expand(raw);
+        let allow_pairs = expand(allow.iter().cloned());
         Ok(DenyList {
-            deny: build_set(&deny_patterns)?,
-            allow: build_set(&allow_patterns)?,
-            deny_patterns,
+            deny: build_set(&deny_pairs)?,
+            allow: build_set(&allow_pairs)?,
+            deny_patterns: deny_pairs.into_iter().map(|(f, _)| f).collect(),
+            has_allow: !allow_pairs.is_empty(),
         })
     }
 
@@ -247,6 +264,16 @@ impl DenyList {
     /// Deny globs as ripgrep `--glob` arguments (`!pattern`); allow exceptions are not expressible.
     pub fn rg_globs(&self) -> Vec<String> {
         self.deny_patterns.iter().map(|p| format!("!{p}")).collect()
+    }
+
+    /// Deny globs that are safe to hand to ripgrep: none when an allow list exists, since rg cannot
+    /// express the exceptions and the caller's post-filter applies them.
+    pub fn rg_globs_safe(&self) -> Vec<String> {
+        if self.has_allow {
+            Vec::new()
+        } else {
+            self.rg_globs()
+        }
     }
 }
 
@@ -332,6 +359,18 @@ mod tests {
             "cfg/secrets.yaml",
             "secrets.json",
             ".git/config",
+            "home/.ssh/id_ecdsa",
+            "id_dsa.pub",
+            "keys/AuthKey_ABC123.p8",
+            "web/.htpasswd",
+            "home/.git-credentials",
+            "home/.docker/config.json",
+            "deploy/kubeconfig",
+            "deploy/kubeconfig-prod.yaml",
+            "vault/db.kdbx",
+            "backup/secrets.GPG",
+            "gcp/service-account.json",
+            "gcp/service-account-prod.json",
         ] {
             assert!(
                 d.is_denied(&p_unchecked(denied)),
@@ -346,6 +385,8 @@ mod tests {
             "docs/keyboard.md",
             ".github/workflows/ci.yml",
             "secretsanta.txt",
+            "docs/.docker/readme.md",
+            "gcp/service.json",
             "",
         ] {
             assert!(!d.is_denied(&p_unchecked(allowed)), "{allowed} should pass");
@@ -383,6 +424,26 @@ mod tests {
         let d = DenyList::new(false, &[], &[]).expect("compiles");
         assert!(!d.is_denied(&p(".env")));
         assert!(d.rg_globs().is_empty());
+    }
+
+    #[test]
+    fn slashless_user_patterns_match_at_any_depth() {
+        let d = DenyList::new(false, &["*.secret".to_string()], &[]).expect("compiles");
+        assert!(d.is_denied(&p("x.secret")));
+        assert!(d.is_denied(&p("a/b/x.secret")));
+        assert!(!d.is_denied(&p("a/b/x.secrets")));
+        let d =
+            DenyList::new(true, &[], &["credentials-example.json".to_string()]).expect("compiles");
+        assert!(!d.is_denied(&p("deep/dir/credentials-example.json")));
+        assert!(d.is_denied(&p("deep/dir/credentials-prod.json")));
+    }
+
+    #[test]
+    fn rg_globs_safe_is_empty_with_an_allow_list() {
+        assert!(!defaults().rg_globs_safe().is_empty());
+        let d = DenyList::new(true, &[], &["**/.env.example".to_string()]).expect("compiles");
+        assert!(d.rg_globs_safe().is_empty());
+        assert!(!d.rg_globs().is_empty());
     }
 
     #[test]

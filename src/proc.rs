@@ -75,6 +75,11 @@ impl Workers {
         }
     }
 
+    /// Total number of slots.
+    pub fn max_concurrent(&self) -> usize {
+        self.max
+    }
+
     /// Number of slots currently held.
     pub fn busy(&self) -> usize {
         self.max.saturating_sub(self.sem.available_permits())
@@ -122,7 +127,17 @@ pub fn scrubbed_command(program: impl AsRef<OsStr>) -> Command {
 
 /// Runs `cmd` with null stdin. Non-zero exit is `ProcError::Failed`.
 pub async fn run(cmd: Command, timeout: Duration, kind: &'static str) -> Result<Output, ProcError> {
-    run_inner(cmd, timeout, kind, None).await
+    run_inner(cmd, timeout, kind, None, STDOUT_CAP).await
+}
+
+/// Like `run`, with captured stdout cut at `stdout_cap` bytes (`Output::stdout_truncated`).
+pub async fn run_capped(
+    cmd: Command,
+    timeout: Duration,
+    kind: &'static str,
+    stdout_cap: usize,
+) -> Result<Output, ProcError> {
+    run_inner(cmd, timeout, kind, None, stdout_cap).await
 }
 
 /// Like `run`, feeding `stdin` to the child.
@@ -132,7 +147,7 @@ pub async fn run_with_stdin(
     kind: &'static str,
     stdin: Vec<u8>,
 ) -> Result<Output, ProcError> {
-    run_inner(cmd, timeout, kind, Some(stdin)).await
+    run_inner(cmd, timeout, kind, Some(stdin), STDOUT_CAP).await
 }
 
 /// Reads up to `cap` bytes, then drains the rest so the child never blocks on a full pipe.
@@ -171,11 +186,29 @@ fn kill_group(pid: Option<u32>) {
     }
 }
 
+/// Kills the child's process group when dropped before the child was waited on.
+struct GroupGuard(Option<u32>);
+
+impl GroupGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            kill_group(self.0);
+        }
+    }
+}
+
 async fn run_inner(
     mut cmd: Command,
     timeout: Duration,
     kind: &'static str,
     stdin: Option<Vec<u8>>,
+    stdout_cap: usize,
 ) -> Result<Output, ProcError> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.stdin(if stdin.is_some() {
@@ -185,6 +218,7 @@ async fn run_inner(
     });
     let mut child = cmd.spawn().map_err(ProcError::Spawn)?;
     let pid = child.id();
+    let mut guard = GroupGuard(pid);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdin_pipe = child.stdin.take();
@@ -198,22 +232,24 @@ async fn run_inner(
         };
         let (_, out, err, status) = tokio::join!(
             feed,
-            read_capped(stdout, STDOUT_CAP),
+            read_capped(stdout, stdout_cap),
             read_capped(stderr, STDERR_CAP),
             child.wait()
         );
         (out, err, status)
     };
 
-    match tokio::time::timeout(timeout, work).await {
-        Err(_) => {
-            kill_group(pid);
-            let _ = child.wait().await;
-            Err(ProcError::Timeout {
-                kind,
-                after: timeout,
-            })
-        }
+    let finished = tokio::time::timeout(timeout, work).await;
+    if finished.is_err() {
+        kill_group(pid);
+        let _ = child.wait().await;
+    }
+    guard.disarm();
+    match finished {
+        Err(_) => Err(ProcError::Timeout {
+            kind,
+            after: timeout,
+        }),
         Ok(((stdout, stdout_truncated), (stderr, stderr_truncated), status)) => {
             let status = status.map_err(ProcError::Spawn)?;
             if status.success() {
@@ -305,10 +341,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_future_kills_the_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild");
+        let mut cmd = scrubbed_command("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 30 & echo $! > {}; wait", pid_file.display()));
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(700),
+            run(cmd, Duration::from_secs(60), "drop"),
+        )
+        .await;
+        assert!(dropped.is_err(), "run must still be pending when dropped");
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(wait_gone(pid).await, "grandchild {pid} still alive");
+    }
+
+    #[tokio::test]
+    async fn run_capped_cuts_stdout_at_the_cap() {
+        let mut cmd = scrubbed_command("sh");
+        cmd.arg("-c").arg("head -c 5000 /dev/zero");
+        let out = run_capped(cmd, Duration::from_secs(5), "cap", 1000)
+            .await
+            .unwrap();
+        assert_eq!(out.stdout.len(), 1000);
+        assert!(out.stdout_truncated);
+    }
+
+    #[tokio::test]
     async fn workers_busy_when_exhausted() {
         let workers = Workers::new(1, Duration::from_millis(100));
         let first = workers.acquire().await.unwrap();
         assert_eq!(workers.busy(), 1);
+        assert_eq!(workers.max_concurrent(), 1);
         assert!(matches!(workers.acquire().await, Err(ProcError::Busy)));
         drop(first);
         assert_eq!(workers.busy(), 0);

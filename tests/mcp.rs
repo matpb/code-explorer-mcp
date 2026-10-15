@@ -133,6 +133,12 @@ async fn initialize_and_tools_list() {
         assert_eq!(t["annotations"]["readOnlyHint"], true, "{}", t["name"]);
         let desc = t["description"].as_str().unwrap_or_default().to_lowercase();
         assert!(desc.contains("untrusted"), "{}: {desc}", t["name"]);
+        let required = t["outputSchema"]["required"].as_array();
+        assert!(
+            required.is_none_or(Vec::is_empty),
+            "{}: error results carry only `error`",
+            t["name"]
+        );
     }
     let tree = tools
         .iter()
@@ -232,6 +238,7 @@ async fn list_repos_reports_both_repos_ready() {
     assert_eq!(web["commit"], s.env.up.head());
     assert_eq!(web["commit_subject"], SUBJECTS[2]);
     assert_eq!(web["secrets_redacted"], 1);
+    assert_eq!(web["secret_findings"], 1);
     assert_eq!(web["stale_seconds"], 0);
     assert_eq!(web["history_depth"], 200);
 
@@ -242,6 +249,7 @@ async fn list_repos_reports_both_repos_ready() {
     assert_eq!(other["status"], "ready");
     assert_eq!(other["commit"], other_head);
     assert_eq!(other["secrets_redacted"], 0);
+    assert_eq!(other["secret_findings"], 0);
 
     let scoped = s.scoped().await.call("list_repos", json!({})).await;
     assert_eq!(strs(scoped.ok(), "repos", "id"), ["other"]);
@@ -598,6 +606,7 @@ async fn read_file_redacts_secrets_everywhere() {
     );
     assert!(!r.raw.to_string().contains(&secret));
     assert!(!r.raw.to_string().contains("QYLPMN5HHHFPZAM2"));
+    assert!(r.has_notice("secrets_redacted"));
 
     let g = c
         .call(
@@ -612,6 +621,7 @@ async fn read_file_redacts_secrets_everywhere() {
         "aws_access_key_id = [REDACTED:aws-access-token]"
     );
     assert!(!g.raw.to_string().contains("QYLPMN5HHHFPZAM2"));
+    assert!(g.has_notice("secrets_redacted"));
 
     let by_secret = c
         .call(
@@ -856,8 +866,12 @@ async fn grep_context_lines() {
         )
         .await;
     let hit = &r.ok()["matches"][0];
-    assert_eq!(hit["before"], json!(["import React from \"react\";"]));
-    let after = hit["after"][0].as_str().expect("after line");
+    assert_eq!(
+        hit["before"],
+        json!([{"line": 1, "text": "import React from \"react\";"}])
+    );
+    assert_eq!(hit["after"][0]["line"], 3);
+    let after = hit["after"][0]["text"].as_str().expect("after line");
     assert!(after.contains("NEW_LABEL"), "{after}");
     assert!(
         r.text()
@@ -1052,6 +1066,68 @@ async fn grep_never_returns_denied_paths() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grep_leaks_nothing_from_case_variant_denied_files() {
+    let c = default_server().full().await;
+    for mode in ["content", "files", "count"] {
+        let r = c
+            .call(
+                "grep",
+                json!({"repos": ["web"], "pattern": CASE_NEEDLE, "fixed_strings": true, "output": mode}),
+            )
+            .await;
+        let data = r.ok();
+        assert_eq!(data["total_matches_seen"], 0, "{mode}: {}", r.raw);
+        let hits = data.get("matches").or(data.get("files")).expect("results");
+        assert!(hits.as_array().is_some_and(Vec::is_empty), "{mode}");
+        assert!(!r.raw.to_string().contains("Secrets.yaml"));
+        assert!(!r.raw.to_string().contains(".ENV"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grep_context_shows_adjacent_matches_with_line_numbers() {
+    let c = default_server().full().await;
+    let r = c
+        .call(
+            "grep",
+            json!({"repos": ["web"], "pattern": "ADJ_HIT", "context_before": 1, "context_after": 1}),
+        )
+        .await;
+    let m = r.ok()["matches"].as_array().expect("matches").clone();
+    assert_eq!(m.len(), 2);
+    assert_eq!(m[0]["before"], json!([{"line": 1, "text": "intro"}]));
+    assert_eq!(
+        m[0]["after"],
+        json!([{"line": 3, "text": "ADJ_HIT second"}])
+    );
+    assert_eq!(
+        m[1]["before"],
+        json!([{"line": 2, "text": "ADJ_HIT first"}])
+    );
+    assert_eq!(m[1]["after"], json!([{"line": 4, "text": "outro"}]));
+    assert!(r.text().contains("web:docs/adjacent.txt-3- ADJ_HIT second"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grep_searches_files_the_allow_list_re_enables() {
+    let c = feature_server().full().await;
+    let r = c
+        .call(
+            "grep",
+            json!({"repos": ["web"], "pattern": "changeme", "output": "files"}),
+        )
+        .await;
+    assert_eq!(strs(r.ok(), "files", "path"), [".env.example"]);
+    let denied = c
+        .call(
+            "grep",
+            json!({"repos": ["web"], "pattern": ENV_SECRET, "fixed_strings": true}),
+        )
+        .await;
+    assert_eq!(denied.ok()["total_matches_seen"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn log_lists_commits_newest_first() {
     let s = default_server();
     let c = s.full().await;
@@ -1103,7 +1179,11 @@ async fn log_lists_commits_newest_first() {
     let first = &with_files.ok()["commits"][0]["files"];
     assert_eq!(
         first,
-        &json!([{"status": "M", "path": "src/components/Button.tsx"}])
+        &json!([
+            {"status": "A", "path": "docs/adjacent.txt"},
+            {"status": "M", "path": "src/components/Button.tsx"}
+        ]),
+        "denied files such as .ENV and Secrets.yaml are not listed"
     );
     let all_paths: Vec<String> = with_files.data()["commits"]
         .as_array()
@@ -1195,6 +1275,24 @@ async fn blame_attributes_lines_to_commits() {
     assert_eq!(lines[1]["text"], "// BUTTON_MARKER");
     assert_eq!(lines[0]["author_name"], "Test");
     assert_eq!(lines[2]["line"], 3);
+
+    let redacted = c
+        .call(
+            "blame",
+            json!({"repo": "web", "path": "config/keys.txt", "end_line": 1}),
+        )
+        .await;
+    let line = &redacted.ok()["lines"][0];
+    assert_eq!(
+        line["commit"], commits[1],
+        "redacted lines keep their commit"
+    );
+    assert_eq!(
+        line["text"],
+        "aws_access_key_id = [REDACTED:aws-access-token]"
+    );
+    assert!(redacted.has_notice("secrets_redacted"));
+    assert!(!redacted.raw.to_string().contains("QYLPMN5HHHFPZAM2"));
 
     let range = c
         .call("blame", json!({"repo": "web", "path": "src/components/Button.tsx", "start_line": 2, "end_line": 3}))
@@ -1299,6 +1397,11 @@ async fn http_edge_auth_origin_size_and_probes() {
     let text = metrics.text().await.expect("metrics body");
     assert!(text.contains("explorer_tool_calls_total"), "{text}");
     assert!(text.contains("list_repos"));
+
+    assert!(
+        text.contains("explorer_repo_last_success_timestamp_seconds{repo=\"web\"}"),
+        "{text}"
+    );
 
     let evil = post(
         &http,
@@ -1588,7 +1691,9 @@ async fn scan_policies_redact_warn_and_block() {
     assert_eq!(by_id("web")["status"], "ready");
     assert_eq!(by_id("other")["status"], "ready");
     assert_eq!(by_id("web-warn")["status"], "ready");
-    assert_eq!(by_id("web-warn")["secrets_redacted"], 1);
+    assert_eq!(by_id("web-warn")["secrets_redacted"], 0);
+    assert_eq!(by_id("web-warn")["secret_findings"], 1);
+    assert_eq!(by_id("web")["secrets_redacted"], 1);
     assert_eq!(by_id("web-block")["status"], "unavailable");
     assert_eq!(by_id("web-block")["commit"], Value::Null);
 

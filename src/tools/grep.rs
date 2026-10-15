@@ -1,11 +1,12 @@
 //! `grep`: ripgrep over the worktrees of one or several repos, run in parallel under the worker cap.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use futures::future::join_all;
+use futures::StreamExt;
+use futures::stream;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +22,9 @@ use crate::auth::AuthContext;
 use crate::paths::RepoPath;
 use crate::proc::{self, ProcError};
 use crate::snapshot::{RepoState, Snapshot};
+
+/// Cap on the ripgrep stdout buffered per repo.
+const RG_STDOUT_CAP: usize = 16 * 1024 * 1024;
 
 fn default_max_results() -> u32 {
     100
@@ -105,14 +109,21 @@ pub struct Params {
     pub max_per_file: u32,
 }
 
+/// One context line around a match, with its real line number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct CtxLine {
+    pub line: u64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct MatchOut {
     pub repo: String,
     pub path: String,
     pub line: u64,
     pub text: String,
-    pub before: Vec<String>,
-    pub after: Vec<String>,
+    pub before: Vec<CtxLine>,
+    pub after: Vec<CtxLine>,
     pub permalink: String,
 }
 
@@ -127,7 +138,7 @@ pub struct FileOut {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Skipped {
     pub repo: String,
-    /// repo_not_ready or timeout.
+    /// repo_not_ready, timeout or busy.
     pub reason: String,
 }
 
@@ -147,8 +158,8 @@ pub(crate) struct RawMatch {
     pub path: String,
     pub line: u64,
     pub text: String,
-    pub before: Vec<String>,
-    pub after: Vec<String>,
+    pub before: Vec<(u64, String)>,
+    pub after: Vec<(u64, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -157,6 +168,9 @@ struct RepoHits {
     files: Vec<(String, Option<u64>)>,
     seen: u64,
     stdout_truncated: bool,
+    file_capped: bool,
+    /// Matches were found beyond the `keep` bound.
+    trimmed: bool,
 }
 
 enum RepoFail {
@@ -182,36 +196,78 @@ fn clean_path(p: &str) -> &str {
     p.strip_prefix("./").unwrap_or(p)
 }
 
-struct FileBlock {
-    path: String,
-    matches: Vec<(u64, String)>,
-    context: BTreeMap<u64, String>,
+/// What `parse_json` keeps and counts.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JsonOpts {
+    pub before: u32,
+    pub after: u32,
+    /// Matches kept (the first by path and line); every allowed match is still counted.
+    pub keep: usize,
+    pub max_per_file: u32,
 }
 
-impl FileBlock {
-    fn finish(self, before: u32, after: u32, out: &mut Vec<RawMatch>) {
-        for (line, text) in self.matches {
-            let lo = line.saturating_sub(u64::from(before));
-            let b = (lo..line)
-                .filter_map(|n| self.context.get(&n).cloned())
-                .collect();
-            let a = (line + 1..=line + u64::from(after))
-                .filter_map(|n| self.context.get(&n).cloned())
-                .collect();
-            out.push(RawMatch {
-                path: self.path.clone(),
+#[derive(Debug, Default)]
+pub(crate) struct Parsed {
+    pub matches: Vec<RawMatch>,
+    /// Matches in files that passed the filter.
+    pub seen: u64,
+    /// Some file reached `max_per_file` matches.
+    pub file_capped: bool,
+}
+
+/// Every line rg reported for one file (matches and context), by line number.
+struct FileBlock {
+    path: String,
+    allowed: bool,
+    matches: Vec<u64>,
+    lines: BTreeMap<u64, String>,
+}
+
+impl Parsed {
+    fn sort_and_trim(&mut self, keep: usize) {
+        self.matches
+            .sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+        self.matches.truncate(keep);
+    }
+
+    fn finish(&mut self, block: FileBlock, o: &JsonOpts) {
+        if !block.allowed || block.matches.is_empty() {
+            return;
+        }
+        self.seen += block.matches.len() as u64;
+        self.file_capped |= block.matches.len() as u64 >= u64::from(o.max_per_file);
+        let ctx = |range: std::ops::RangeInclusive<u64>| -> Vec<(u64, String)> {
+            range
+                .filter_map(|n| block.lines.get(&n).map(|t| (n, t.clone())))
+                .collect()
+        };
+        for &line in &block.matches {
+            let Some(text) = block.lines.get(&line) else {
+                continue;
+            };
+            let lo = line.saturating_sub(u64::from(o.before)).max(1);
+            self.matches.push(RawMatch {
+                path: block.path.clone(),
                 line,
-                text,
-                before: b,
-                after: a,
+                text: text.clone(),
+                before: if lo < line {
+                    ctx(lo..=line - 1)
+                } else {
+                    Vec::new()
+                },
+                after: ctx(line + 1..=line + u64::from(o.after)),
             });
+        }
+        if self.matches.len() > o.keep.saturating_mul(2).max(64) {
+            self.sort_and_trim(o.keep);
         }
     }
 }
 
 /// Parses `rg --json` output; a trailing partial line (output cap) is ignored.
-pub(crate) fn parse_json(stdout: &[u8], before: u32, after: u32) -> Vec<RawMatch> {
-    let mut out = Vec::new();
+/// Files for which `allow(path)` is false are neither kept nor counted.
+pub(crate) fn parse_json(stdout: &[u8], o: JsonOpts, allow: &dyn Fn(&str) -> bool) -> Parsed {
+    let mut out = Parsed::default();
     let mut current: Option<FileBlock> = None;
     for raw in stdout.split(|b| *b == b'\n') {
         if raw.is_empty() {
@@ -224,41 +280,45 @@ pub(crate) fn parse_json(stdout: &[u8], before: u32, after: u32) -> Vec<RawMatch
         match msg["type"].as_str() {
             Some("begin") => {
                 if let Some(done) = current.take() {
-                    done.finish(before, after, &mut out);
+                    out.finish(done, &o);
                 }
                 if let Some(path) = data.get("path").and_then(decode_text) {
+                    let path = clean_path(&path).to_owned();
                     current = Some(FileBlock {
-                        path: clean_path(&path).to_owned(),
+                        allowed: allow(&path),
+                        path,
                         matches: Vec::new(),
-                        context: BTreeMap::new(),
+                        lines: BTreeMap::new(),
                     });
                 }
             }
             Some(kind @ ("match" | "context")) => {
-                let (Some(block), Some(line), Some(text)) = (
-                    current.as_mut(),
+                let Some(block) = current.as_mut().filter(|b| b.allowed) else {
+                    continue;
+                };
+                let (Some(line), Some(text)) = (
                     data["line_number"].as_u64(),
                     data.get("lines").and_then(decode_text),
                 ) else {
                     continue;
                 };
                 if kind == "match" {
-                    block.matches.push((line, trim_eol(&text)));
-                } else {
-                    block.context.insert(line, trim_eol(&text));
+                    block.matches.push(line);
                 }
+                block.lines.insert(line, trim_eol(&text));
             }
             Some("end") => {
                 if let Some(done) = current.take() {
-                    done.finish(before, after, &mut out);
+                    out.finish(done, &o);
                 }
             }
             _ => {}
         }
     }
     if let Some(done) = current.take() {
-        done.finish(before, after, &mut out);
+        out.finish(done, &o);
     }
+    out.sort_and_trim(o.keep);
     out
 }
 
@@ -332,6 +392,7 @@ fn rg_command(
     let mut cmd = proc::scrubbed_command(ex.cfg.rg_bin());
     cmd.current_dir(&snap.root);
     cmd.args(["--no-config", "--hidden", "--no-ignore", "--no-follow"]);
+    cmd.args(["--encoding", "none"]);
     cmd.arg("--max-filesize")
         .arg(ex.cfg.limits.max_file_bytes.to_string());
     cmd.args(["--max-columns", "500", "--max-columns-preview"]);
@@ -369,10 +430,10 @@ fn rg_command(
     for g in &p.glob {
         cmd.arg("-g").arg(g);
     }
-    for g in ex.deny.rg_globs() {
-        cmd.arg("-g").arg(g);
+    for g in ex.deny.rg_globs_safe() {
+        cmd.arg("--iglob").arg(g);
     }
-    cmd.args(["-g", "!.git", "-g", "!**/.git"]);
+    cmd.args(["--iglob", "!.git", "--iglob", "!**/.git"]);
     for t in &p.types {
         cmd.arg("-t").arg(t);
     }
@@ -386,9 +447,12 @@ async fn search_repo(
     p: &Params,
     search_path: &str,
 ) -> Result<RepoHits, RepoFail> {
-    let _permit = ex.workers.acquire().await.map_err(|_| RepoFail::Busy)?;
+    let _permit = ex.workers.acquire().await.map_err(|_| {
+        ex.metrics.queue_rejection();
+        RepoFail::Busy
+    })?;
     let cmd = rg_command(ex, &snap, p, search_path);
-    let output = match proc::run(cmd, ex.cfg.limits.rg_timeout, "rg").await {
+    let output = match proc::run_capped(cmd, ex.cfg.limits.rg_timeout, "rg", RG_STDOUT_CAP).await {
         Ok(out) => out,
         Err(ProcError::Timeout { .. }) => {
             ex.metrics.subprocess_timeout("rg");
@@ -401,21 +465,38 @@ async fn search_repo(
         }
         Err(e @ ProcError::Spawn(_)) => return Err(RepoFail::Error(ToolError::internal(e))),
     };
+    let allow = |path: &str| {
+        RepoPath::parse(path).is_ok_and(|rp| !ex.deny.is_denied(&rp) && !snap.index.is_utf16(&rp))
+    };
     let mut hits = RepoHits {
         stdout_truncated: output.stdout_truncated,
         ..Default::default()
     };
     match p.output {
         Mode::Content => {
-            hits.matches = parse_json(&output.stdout, p.context_before, p.context_after);
-            hits.seen = hits.matches.len() as u64;
+            let parsed = parse_json(
+                &output.stdout,
+                JsonOpts {
+                    before: p.context_before,
+                    after: p.context_after,
+                    keep: p.max_results as usize,
+                    max_per_file: p.max_per_file,
+                },
+                &allow,
+            );
+            hits.trimmed = parsed.seen > parsed.matches.len() as u64;
+            hits.matches = parsed.matches;
+            hits.seen = parsed.seen;
+            hits.file_capped = parsed.file_capped;
         }
         Mode::Files => {
             hits.files = parse_plain(&output.stdout, false);
+            hits.files.retain(|(path, _)| allow(path));
             hits.seen = hits.files.len() as u64;
         }
         Mode::Count => {
             hits.files = parse_plain(&output.stdout, true);
+            hits.files.retain(|(path, _)| allow(path));
             hits.seen = hits.files.iter().filter_map(|(_, n)| *n).sum();
         }
     }
@@ -542,13 +623,22 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
         path.as_str().to_owned()
     };
 
-    let runs = ready.iter().filter_map(|t| t.snap.as_ref()).map(|snap| {
-        let snap = snap.clone();
-        let search_path = search_path.clone();
-        let params = &p;
-        async move { search_repo(ex, snap, params, &search_path).await }
-    });
-    let results = join_all(runs).await;
+    let jobs: Vec<(usize, Arc<Snapshot>)> = ready
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| t.snap.clone().map(|snap| (i, snap)))
+        .collect();
+    let width = jobs.len().min(ex.workers.max_concurrent()).max(1);
+    let mut results: Vec<(usize, Result<RepoHits, RepoFail>)> = stream::iter(jobs)
+        .map(|(i, snap)| {
+            let search_path = &search_path;
+            let params = &p;
+            async move { (i, search_repo(ex, snap, params, search_path).await) }
+        })
+        .buffer_unordered(width)
+        .collect()
+        .await;
+    results.sort_by_key(|(i, _)| *i);
 
     let mut skipped: Vec<Skipped> = not_ready
         .iter()
@@ -561,15 +651,18 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
     let mut sources = Vec::new();
     let mut all_matches: Vec<MatchOut> = Vec::new();
     let mut all_files: Vec<FileOut> = Vec::new();
+    let mut redacted_files: HashSet<(String, String)> = HashSet::new();
     let mut seen_total = 0u64;
     let mut timed_out = 0usize;
+    let mut busy = 0usize;
     let mut cut_any = false;
     let mut per_file_capped = false;
+    let mut trimmed = false;
     let mut log = LogInfo::default();
     let mut redacted = 0usize;
     let max_chars = ex.cfg.limits.max_line_chars;
 
-    for (t, result) in ready.iter().zip(results) {
+    for (t, (_, result)) in ready.iter().zip(results) {
         let (Some(snap), state) = (t.snap.as_ref(), &t.state) else {
             continue;
         };
@@ -583,7 +676,14 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
                 });
                 continue;
             }
-            Err(RepoFail::Busy) => return Err(ToolError::busy()),
+            Err(RepoFail::Busy) => {
+                busy += 1;
+                skipped.push(Skipped {
+                    repo: state.cfg.id.clone(),
+                    reason: "busy".into(),
+                });
+                continue;
+            }
             Err(RepoFail::Error(e)) => return Err(e),
         };
         let source = ex.source(state, snap);
@@ -592,27 +692,20 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
         notices.push_opt(stale_notice(&ex.cfg, state).map(|n| n.for_repo(&state.cfg.id)));
         if hits.stdout_truncated {
             notices.push(Notice::output_truncated(
-                "search output cap",
-                "Narrow with path, glob or type.",
+                "max_results (search output cap)",
+                "The search produced more output than one search may buffer, so matches are missing; narrow with path, glob or type.",
             ));
         }
         seen_total += hits.seen;
+        per_file_capped |= hits.file_capped;
+        trimmed |= hits.trimmed;
         let mut red = Redaction::new(&snap.redactor);
-        let mut kept = hits.matches;
-        if p.output == Mode::Content {
-            let mut per_file: BTreeMap<&str, u32> = BTreeMap::new();
-            for m in &kept {
-                *per_file.entry(m.path.as_str()).or_default() += 1;
-            }
-            per_file_capped |= per_file.values().any(|n| *n >= p.max_per_file);
-        }
-        kept.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-        for m in kept {
+        for m in hits.matches {
             let Ok(rp) = RepoPath::parse(&m.path) else {
                 continue;
             };
-            if ex.deny.is_denied(&rp) {
-                continue;
+            if snap.index.is_redacted(&rp) {
+                redacted_files.insert((state.cfg.id.clone(), rp.as_str().to_owned()));
             }
             let mut shape = |s: &str| {
                 let masked = red.apply(s);
@@ -620,6 +713,17 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
                 cut_any |= was;
                 cut.into_owned()
             };
+            let mut ctx = |lines: &[(u64, String)]| -> Vec<CtxLine> {
+                lines
+                    .iter()
+                    .map(|(line, text)| CtxLine {
+                        line: *line,
+                        text: shape(text),
+                    })
+                    .collect()
+            };
+            let before = ctx(&m.before);
+            let after = ctx(&m.after);
             all_matches.push(MatchOut {
                 repo: state.cfg.id.clone(),
                 permalink: permalink(
@@ -633,8 +737,8 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
                 path: rp.as_str().to_owned(),
                 line: m.line,
                 text: shape(&m.text),
-                before: m.before.iter().map(|s| shape(s)).collect(),
-                after: m.after.iter().map(|s| shape(s)).collect(),
+                before,
+                after,
             });
         }
         let mut files = hits.files;
@@ -643,8 +747,8 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
             let Ok(rp) = RepoPath::parse(&fp) else {
                 continue;
             };
-            if ex.deny.is_denied(&rp) {
-                continue;
+            if snap.index.is_redacted(&rp) {
+                redacted_files.insert((state.cfg.id.clone(), rp.as_str().to_owned()));
             }
             all_files.push(FileOut {
                 repo: state.cfg.id.clone(),
@@ -655,15 +759,20 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
         redacted += red.hits;
     }
 
-    if sources.is_empty() && timed_out > 0 {
-        return Err(ToolError::timeout(ex.rg_timeout_message()));
+    if sources.is_empty() {
+        if timed_out > 0 {
+            return Err(ToolError::timeout(ex.rg_timeout_message()));
+        }
+        if busy > 0 {
+            return Err(ToolError::busy());
+        }
     }
 
     let cap = p.max_results as usize;
     let before_cap = all_matches.len().max(all_files.len());
     all_matches.truncate(cap);
     all_files.truncate(cap);
-    if before_cap > cap {
+    if before_cap > cap || trimmed {
         notices.push(Notice::output_truncated(
             "max_results",
             "Narrow with path, glob or type, or raise max_results (max 1000).",
@@ -680,9 +789,6 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
             "max_line_chars",
             "Some lines were cut; read_file with a line range shows the full text.",
         ));
-    }
-    if redacted > 0 {
-        notices.push(Notice::secrets_redacted(redacted));
     }
 
     let budget = ex.cfg.limits.max_response_bytes / 2;
@@ -722,17 +828,27 @@ pub async fn run(ex: &Explorer, auth: &AuthContext, p: Params) -> Result<ToolOut
             "Narrow with path, glob or type, or lower context_before and context_after.",
         ));
     }
+    let served: HashSet<(&str, &str)> = all_matches
+        .iter()
+        .map(|m| (m.repo.as_str(), m.path.as_str()))
+        .chain(all_files.iter().map(|f| (f.repo.as_str(), f.path.as_str())))
+        .collect();
+    let files_redacted = redacted_files
+        .iter()
+        .filter(|(r, p)| served.contains(&(r.as_str(), p.as_str())))
+        .count();
+    if redacted + files_redacted > 0 {
+        notices.push(Notice::secrets_redacted(redacted.max(files_redacted)));
+    }
 
     let mut text = String::new();
     for m in &all_matches {
-        for (i, line) in m.before.iter().enumerate() {
-            let n = m.line as usize - m.before.len() + i;
-            text.push_str(&format!("{}:{}-{n}- {line}\n", m.repo, m.path));
+        for c in &m.before {
+            text.push_str(&format!("{}:{}-{}- {}\n", m.repo, m.path, c.line, c.text));
         }
         text.push_str(&format!("{}:{}:{}: {}\n", m.repo, m.path, m.line, m.text));
-        for (i, line) in m.after.iter().enumerate() {
-            let n = m.line as usize + 1 + i;
-            text.push_str(&format!("{}:{}-{n}- {line}\n", m.repo, m.path));
+        for c in &m.after {
+            text.push_str(&format!("{}:{}-{}- {}\n", m.repo, m.path, c.line, c.text));
         }
     }
     for f in &all_files {
@@ -772,13 +888,91 @@ mod tests {
             r#"{"type":"match","data":{"path":{"text":"b.txt"},"lines":{"text":"foo\n"},"line_number":9"#,
         ]
         .join("\n");
-        let got = parse_json(lines.as_bytes(), 1, 1);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].path, "a.txt");
-        assert_eq!(got[0].line, 2);
-        assert_eq!(got[0].text, "two foo");
-        assert_eq!(got[0].before, vec!["one"]);
-        assert_eq!(got[0].after, vec!["three"]);
+        let got = parse_json(lines.as_bytes(), opts(1, 1, 10), &|_| true);
+        assert_eq!(got.matches.len(), 1);
+        assert_eq!(got.seen, 1);
+        let m = &got.matches[0];
+        assert_eq!(m.path, "a.txt");
+        assert_eq!(m.line, 2);
+        assert_eq!(m.text, "two foo");
+        assert_eq!(m.before, vec![(1, "one".to_owned())]);
+        assert_eq!(m.after, vec![(3, "three".to_owned())]);
+    }
+
+    fn opts(before: u32, after: u32, keep: usize) -> JsonOpts {
+        JsonOpts {
+            before,
+            after,
+            keep,
+            max_per_file: 20,
+        }
+    }
+
+    fn rg_file(path: &str, rows: &[(&str, u64, &str)]) -> String {
+        let mut out = vec![format!(
+            r#"{{"type":"begin","data":{{"path":{{"text":"{path}"}}}}}}"#
+        )];
+        for (kind, n, text) in rows {
+            out.push(format!(
+                r#"{{"type":"{kind}","data":{{"path":{{"text":"{path}"}},"lines":{{"text":"{text}\n"}},"line_number":{n}}}}}"#
+            ));
+        }
+        out.push(format!(
+            r#"{{"type":"end","data":{{"path":{{"text":"{path}"}}}}}}"#
+        ));
+        out.join("\n")
+    }
+
+    #[test]
+    fn adjacent_matches_are_context_of_each_other_with_line_numbers() {
+        let input = rg_file(
+            "a.txt",
+            &[
+                ("context", 1, "zero"),
+                ("match", 2, "foo one"),
+                ("match", 3, "foo two"),
+                ("context", 4, "after"),
+            ],
+        );
+        let got = parse_json(input.as_bytes(), opts(2, 2, 10), &|_| true);
+        assert_eq!(got.seen, 2);
+        let (first, second) = (&got.matches[0], &got.matches[1]);
+        assert_eq!(first.before, vec![(1, "zero".to_owned())]);
+        assert_eq!(
+            first.after,
+            vec![(3, "foo two".to_owned()), (4, "after".to_owned())]
+        );
+        assert_eq!(
+            second.before,
+            vec![(1, "zero".to_owned()), (2, "foo one".to_owned())]
+        );
+        assert_eq!(second.after, vec![(4, "after".to_owned())]);
+    }
+
+    #[test]
+    fn filtered_files_are_neither_kept_nor_counted() {
+        let input = [
+            rg_file("ok.txt", &[("match", 1, "foo")]),
+            rg_file(".ENV", &[("match", 1, "foo"), ("match", 2, "foo")]),
+        ]
+        .join("\n");
+        let allow = |p: &str| p != ".ENV";
+        let got = parse_json(input.as_bytes(), opts(0, 0, 10), &allow);
+        assert_eq!(got.seen, 1);
+        assert_eq!(got.matches.len(), 1);
+        assert_eq!(got.matches[0].path, "ok.txt");
+    }
+
+    #[test]
+    fn keep_bounds_matches_but_not_the_count() {
+        let mut input = Vec::new();
+        for f in (0..200).rev() {
+            input.push(rg_file(&format!("f{f:03}.txt"), &[("match", 1, "foo")]));
+        }
+        let got = parse_json(input.join("\n").as_bytes(), opts(0, 0, 3), &|_| true);
+        assert_eq!(got.seen, 200);
+        let paths: Vec<&str> = got.matches.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, ["f000.txt", "f001.txt", "f002.txt"]);
     }
 
     #[test]

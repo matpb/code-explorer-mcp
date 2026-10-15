@@ -8,6 +8,7 @@ use super::Explorer;
 use super::envelope::{LogInfo, Notice, Notices, Redaction, ToolOutput, rfc3339, to_value};
 use super::errors::ToolError;
 use crate::auth::AuthContext;
+use crate::config::ScanPolicy;
 use crate::snapshot::RepoStatus;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -28,7 +29,10 @@ pub struct RepoInfo {
     pub status: String,
     pub stale_seconds: u64,
     pub history_depth: u32,
+    /// Values masked in served content: the finding count under the `redact` policy, otherwise 0.
     pub secrets_redacted: usize,
+    /// Secret findings of the current snapshot, whatever the policy.
+    pub secret_findings: usize,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -54,6 +58,7 @@ pub async fn run(
             stale_ids.push(state.cfg.id.clone());
         }
         let snap = state.snapshot();
+        let policy = state.cfg.scan_policy_or(ex.cfg.scan.policy);
         let pulled = state
             .status()
             .last_success
@@ -101,7 +106,12 @@ pub async fn run(
             status: status.as_str().to_owned(),
             stale_seconds,
             history_depth: ex.cfg.pull.depth,
-            secrets_redacted: findings,
+            secrets_redacted: if policy == ScanPolicy::Redact {
+                findings
+            } else {
+                0
+            },
+            secret_findings: findings,
         });
     }
     let mut notices = Notices::default();

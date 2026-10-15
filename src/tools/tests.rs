@@ -193,7 +193,7 @@ impl Fx {
             std::fs::create_dir_all(&dirs.snapshots).unwrap();
             git.worktree_add(&dirs.git, &oid, &wt).await.unwrap();
             let entries = git.ls_tree(&dirs.git, &oid).await.unwrap();
-            let index = FileIndex::from_git(entries).unwrap();
+            let index = FileIndex::from_git(entries);
             let redactor = Arc::new(Redactor::new(&[(fake_aws(), "aws-access-token".into())]));
             let snap = Snapshot::new(
                 oid.clone(),
@@ -1038,10 +1038,10 @@ async fn grep_context_and_modes() {
     let r = call(&ex, &a, "grep", json!({"pattern": "export function Button", "repos": ["web"], "context_before": 1, "context_after": 1})).await;
     let v = ok(&r);
     let m = &v["matches"][0];
-    assert_eq!(m["before"], json!([""]));
+    assert_eq!(m["before"], json!([{"line": 2, "text": ""}]));
     assert_eq!(
         m["after"],
-        json!(["  // variant line 00 of the Button component"])
+        json!([{"line": 4, "text": "  // variant line 00 of the Button component"}])
     );
     assert!(text(&r).contains("web:src/components/Button.tsx-4-   // variant line 00"));
 
@@ -1791,11 +1791,10 @@ async fn list_tools_is_per_key_and_feature_gated() {
         assert_eq!(ann.idempotent_hint, Some(true));
         let out = t.output_schema.as_ref().unwrap();
         assert!(
-            out["required"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("notices")),
-            "{}",
+            out.get("required")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "{} must not require fields that error results lack",
             t.name
         );
         assert!(out["properties"].get("notices").is_some());
@@ -1929,4 +1928,320 @@ fn error_codes_serialize_as_snake_case() {
     assert_eq!(res.is_error, Some(true));
     assert!(text(&res).starts_with("path_not_found: a.txt not found at r@abc1234."));
     assert_eq!(sc(&res)["error"]["retryable"], false);
+}
+
+impl Fx {
+    /// Replaces the snapshot of `id` with one that has `redactor` and the given at-rest rewritten paths.
+    async fn rebuild(&self, id: &str, redactor: Option<Redactor>, rewritten: &[&str]) {
+        let state = self.registry.get(id).unwrap();
+        let old = state.snapshot().unwrap();
+        let dirs = data_layout(&self.tmp.path().join("data"), id);
+        let mut index =
+            FileIndex::from_git(self.git.ls_tree(&dirs.git, &old.commit).await.unwrap());
+        for p in rewritten {
+            index.mark_redacted(&RepoPath::parse(p).unwrap());
+        }
+        let redactor = redactor.map_or_else(|| old.redactor.clone(), Arc::new);
+        state.set_snapshot(Arc::new(Snapshot::new(
+            old.commit.clone(),
+            old.commit_time,
+            old.commit_subject.clone(),
+            old.root.clone(),
+            index,
+            redactor,
+            old.findings,
+            old.pulled_at,
+        )));
+    }
+
+    /// Mimics redaction at rest for `config/keys.txt`: the worktree copy carries the marker.
+    async fn rewrite_keys_at_rest(&self) {
+        let wt = self.worktree("web");
+        let body = std::fs::read_to_string(wt.join("config/keys.txt")).unwrap();
+        let masked = body.replace(&fake_aws(), "[REDACTED:aws-access-token]");
+        std::fs::write(wt.join("config/keys.txt"), masked).unwrap();
+        self.rebuild("web", None, &["config/keys.txt"]).await;
+    }
+}
+
+fn match_paths(v: &Value) -> Vec<String> {
+    v["matches"]
+        .as_array()
+        .map(|m| {
+            m.iter()
+                .map(|x| x["path"].as_str().unwrap().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn grep_leaks_nothing_from_denied_paths_in_other_letter_cases() {
+    let fx = Fx::standard().await;
+    let wt = fx.worktree("web");
+    write(&wt, ".ENV", "ONLY_DENIED_ZZ=1\nSHARED_ZZ=1\n");
+    write(
+        &wt,
+        "Secrets.yaml",
+        "only: ONLY_DENIED_ZZ\nshared: SHARED_ZZ\n",
+    );
+    write(&wt, "plain.txt", "SHARED_ZZ\n");
+    let ex = fx.explorer();
+    let a = auth(None);
+    for mode in ["content", "files", "count"] {
+        let r = call(
+            &ex,
+            &a,
+            "grep",
+            json!({"pattern": "ONLY_DENIED_ZZ", "repos": ["web"], "output": mode}),
+        )
+        .await;
+        let v = ok(&r);
+        assert_eq!(v["total_matches_seen"], 0, "{mode}: {v}");
+        let hits = v.get("matches").or(v.get("files")).unwrap();
+        assert!(hits.as_array().unwrap().is_empty(), "{mode}: {v}");
+        assert!(text(&r).starts_with("No matches."), "{mode}");
+
+        let r = call(
+            &ex,
+            &a,
+            "grep",
+            json!({"pattern": "SHARED_ZZ", "repos": ["web"], "output": mode}),
+        )
+        .await;
+        let v = ok(&r);
+        assert_eq!(v["total_matches_seen"], 1, "{mode}: {v}");
+        let hits = v
+            .get("matches")
+            .or(v.get("files"))
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{mode}");
+        assert_eq!(hits[0]["path"], "plain.txt");
+    }
+}
+
+#[tokio::test]
+async fn grep_finds_allowed_exceptions_to_the_deny_list() {
+    let fx = Fx::standard().await;
+    let ex = fx.explorer_with(|c| c.deny.allow = vec!["**/.env.example".into()]);
+    let a = auth(None);
+    let r = call(
+        &ex,
+        &a,
+        "grep",
+        json!({"pattern": "changeme", "repos": ["web"]}),
+    )
+    .await;
+    assert_eq!(match_paths(ok(&r)), vec![".env.example"]);
+    let r = call(
+        &ex,
+        &a,
+        "grep",
+        json!({"pattern": "hunter2", "repos": ["web"]}),
+    )
+    .await;
+    assert_eq!(ok(&r)["total_matches_seen"], 0);
+    assert!(match_paths(ok(&r)).is_empty());
+}
+
+#[tokio::test]
+async fn grep_context_includes_adjacent_matches_with_line_numbers() {
+    let fx = Fx::standard().await;
+    write(
+        &fx.worktree("web"),
+        "adj.txt",
+        "intro\nADJ_HIT one\nADJ_HIT two\noutro\n",
+    );
+    let ex = fx.explorer();
+    let r = call(
+        &ex,
+        &auth(None),
+        "grep",
+        json!({"pattern": "ADJ_HIT", "repos": ["web"], "context_before": 1, "context_after": 1}),
+    )
+    .await;
+    let v = ok(&r);
+    let m = v["matches"].as_array().unwrap();
+    assert_eq!(m.len(), 2);
+    assert_eq!(m[0]["before"], json!([{"line": 1, "text": "intro"}]));
+    assert_eq!(m[0]["after"], json!([{"line": 3, "text": "ADJ_HIT two"}]));
+    assert_eq!(m[1]["before"], json!([{"line": 2, "text": "ADJ_HIT one"}]));
+    assert_eq!(m[1]["after"], json!([{"line": 4, "text": "outro"}]));
+    let t = text(&r);
+    assert!(t.contains("web:adj.txt-3- ADJ_HIT two"), "{t}");
+    assert!(t.contains("web:adj.txt-2- ADJ_HIT one"), "{t}");
+}
+
+#[tokio::test]
+async fn grep_with_one_worker_still_searches_every_repo() {
+    let fx = Fx::standard().await;
+    let rg = which_rg();
+    let slow = script(
+        fx.tmp.path(),
+        "rg-slow-start",
+        &format!("sleep 0.3; exec {} \"$@\"", rg.display()),
+    );
+    let ex = fx.explorer_with(|c| {
+        c.server.rg_path = Some(slow.clone());
+        c.limits.max_concurrent_workers = 1;
+        c.limits.queue_timeout = Duration::from_millis(100);
+    });
+    let r = call(&ex, &auth(None), "grep", json!({"pattern": "hello"})).await;
+    let v = ok(&r);
+    assert_eq!(v["sources"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        v["repos_skipped"],
+        json!([{"repo": "docs", "reason": "repo_not_ready"}])
+    );
+
+    let held = ex.workers.acquire().await.unwrap();
+    let r = call(&ex, &auth(None), "grep", json!({"pattern": "hello"})).await;
+    assert_eq!(err_code(&r), "busy");
+    assert!(
+        ex.metrics
+            .render()
+            .contains("explorer_worker_queue_rejections_total 2")
+    );
+    drop(held);
+}
+
+#[tokio::test]
+async fn read_file_at_commit_refuses_big_blobs_before_reading_them() {
+    let fx = Fx::standard().await;
+    let ex = fx.explorer_with(|c| c.features.file_at_commit = true);
+    let r = call(
+        &ex,
+        &auth(None),
+        "read_file",
+        json!({"repo": "web", "path": "big.bin", "commit": &fx.head}),
+    )
+    .await;
+    assert_eq!(err_code(&r), "file_too_large");
+}
+
+#[tokio::test]
+async fn read_file_at_commit_masks_multi_line_secrets_across_lines() {
+    let fx = Fx::standard().await;
+    let secret = "-----BEGIN OPENSSH KEY-----\nab\ncd\n-----END OPENSSH KEY-----";
+    let src = fx.tmp.path().join("source");
+    write(&src, "config/multi.txt", format!("head\n{secret}\ntail\n"));
+    sh_git(&src, &["add", "-A"]);
+    sh_git(&src, &["commit", "-q", "-m", "add multi"]);
+    let bare = data_layout(&fx.tmp.path().join("data"), "web").git;
+    sh_git(&bare, &["fetch", "-q", src.to_str().unwrap(), "main:main"]);
+    let new_head = StdCommand::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&src)
+        .output()
+        .unwrap();
+    let new_head = String::from_utf8_lossy(&new_head.stdout).trim().to_owned();
+    fx.rebuild(
+        "web",
+        Some(Redactor::new(&[(secret.to_owned(), "private-key".into())])),
+        &[],
+    )
+    .await;
+    let ex = fx.explorer_with(|c| c.features.file_at_commit = true);
+    let r = call(
+        &ex,
+        &auth(None),
+        "read_file",
+        json!({"repo": "web", "path": "config/multi.txt", "commit": new_head}),
+    )
+    .await;
+    let v = ok(&r);
+    let content = v["content"].as_str().unwrap();
+    assert!(!content.contains("OPENSSH"), "{content}");
+    assert_eq!(v["total_lines"], 6);
+    assert_eq!(content.matches("[REDACTED:private-key]").count(), 4);
+    assert!(notice_codes(&r).contains(&"secrets_redacted".to_owned()));
+}
+
+#[tokio::test]
+async fn at_rest_redacted_files_carry_the_notice_and_blame_keeps_real_commits() {
+    let fx = Fx::standard().await;
+    fx.rewrite_keys_at_rest().await;
+    let ex = fx.explorer_with(|c| c.features.blame = true);
+    let a = auth(None);
+
+    let r = call(
+        &ex,
+        &a,
+        "read_file",
+        json!({"repo": "web", "path": "config/keys.txt"}),
+    )
+    .await;
+    assert!(ok(&r)["content"].as_str().unwrap().contains("[REDACTED:"));
+    assert!(notice_codes(&r).contains(&"secrets_redacted".to_owned()));
+
+    let r = call(
+        &ex,
+        &a,
+        "grep",
+        json!({"pattern": "REDACTED", "repos": ["web"], "output": "files"}),
+    )
+    .await;
+    assert_eq!(paths_of(ok(&r), "files"), vec!["config/keys.txt"]);
+    assert!(notice_codes(&r).contains(&"secrets_redacted".to_owned()));
+
+    let r = call(
+        &ex,
+        &a,
+        "blame",
+        json!({"repo": "web", "path": "config/keys.txt", "end_line": 1}),
+    )
+    .await;
+    let line = &ok(&r)["lines"][0];
+    assert_eq!(line["commit"], fx.first_commit);
+    assert_eq!(line["author_name"], "Ada Tester");
+    assert_eq!(
+        line["text"],
+        "aws_access_key_id = [REDACTED:aws-access-token]"
+    );
+    assert!(notice_codes(&r).contains(&"secrets_redacted".to_owned()));
+}
+
+#[tokio::test]
+async fn envelope_pulled_at_is_the_last_successful_pull() {
+    let fx = Fx::standard().await;
+    let ex = fx.explorer();
+    let past = Utc::now() - chrono::Duration::hours(2);
+    fx.registry.get("web").unwrap().record_restored(past, 1);
+    let r = call(
+        &ex,
+        &auth(None),
+        "read_file",
+        json!({"repo": "web", "path": "README.md"}),
+    )
+    .await;
+    assert_eq!(
+        ok(&r)["source"]["pulled_at"],
+        envelope::rfc3339(past).as_str()
+    );
+}
+
+#[tokio::test]
+async fn error_results_satisfy_every_advertised_output_schema() {
+    let fx = Fx::standard().await;
+    let ex = fx.explorer();
+    let r = call(&ex, &auth(None), "grep", json!({"pattern": ""})).await;
+    assert!(is_err(&r));
+    let structured = sc(&r).as_object().unwrap();
+    for t in ex.tools_for(Some(&auth(None))) {
+        let schema = t.output_schema.as_ref().unwrap();
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for field in required {
+            assert!(
+                structured.contains_key(field.as_str().unwrap()),
+                "{} requires {field}, which error results lack",
+                t.name
+            );
+        }
+    }
 }
