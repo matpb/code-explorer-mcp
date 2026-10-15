@@ -16,7 +16,7 @@ services:
     tmpfs: ["/tmp"]
     volumes:
       - ./config.toml:/etc/code-explorer/config.toml:ro
-      - ./keys.toml:/etc/code-explorer/keys.toml
+      - ./keys.toml:/etc/code-explorer/keys.toml:ro
       - explorer-data:/data
     secrets:
       - web_ui_key

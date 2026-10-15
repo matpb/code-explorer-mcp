@@ -33,16 +33,16 @@ git clone https://github.com/matpb/code-explorer-mcp.git
 cd code-explorer-mcp/deploy
 cp .env.example .env            # set DOMAIN; change EDGE_SUBNET if 172.30.0.0/24 is taken on this host
 cp ../config.example.toml config.toml
-mkdir -p secrets && touch keys.toml && chmod 666 keys.toml   # keygen runs as uid 10001 inside the container
+mkdir -p secrets && touch keys.toml
 # put each repo's SSH private key (or token) in secrets/, see "Onboarding a repo"
 $EDITOR config.toml             # server.trusted_proxies must match EDGE_SUBNET
 docker compose build
 docker compose run --rm explorer check-config --probe
-docker compose run --rm explorer keygen --name my-agent
+docker compose run --rm explorer keygen --name my-agent --print-only >> keys.toml
 docker compose up -d
 ```
 
-The last `keygen` prints a key once, in the form `cex_<id>_<secret>`. Give it to the client as a Bearer token:
+`keygen --print-only` writes the hashed `[[key]]` entry to stdout (appended to `keys.toml` here) and prints the key itself once on stderr, in the form `cex_<id>_<secret>`. The server never writes `keys.toml`: it is mounted read-only, owned by the operator, and the running server picks up your edits within a few seconds. Give the key to the client as a Bearer token:
 
 ```json
 {
@@ -63,7 +63,7 @@ Check readiness from inside the container with `docker compose exec explorer cod
 Two TOML files, both server-side and never committed:
 
 - `config.toml`: server, limits, pull schedule, scanning, deny-list, credentials and the repo list. Fixed per process.
-- `keys.toml`: client keys as argon2id hashes, written by `keygen`, reloaded on change and on `SIGHUP`.
+- `keys.toml`: client keys as argon2id hashes, maintained by the operator with `keygen --print-only`, read-only to the server, reloaded on change and on `SIGHUP`.
 
 `config.example.toml` documents every field with its default. Unknown fields are errors, every problem is reported at once with file and line, and `check-config` runs the same validation without starting the server.
 
@@ -165,7 +165,8 @@ Credentials are referenced by name and resolved from a secret file or an environ
 
 ## Keys and rotation
 
-- `code-explorer keygen --name <who> [--repos a,b] [--expires YYYY-MM-DD] [--print-only]` appends a hashed entry to `keys.toml` and prints the key once. With `--print-only` it prints the `[[key]]` block instead, for a read-only mount or a keys file the container cannot write.
+- `code-explorer keygen --name <who> [--repos a,b] [--expires YYYY-MM-DD] --print-only` prints the hashed `[[key]]` entry on stdout and the key once on stderr. Append the entry to `keys.toml` yourself (`>> keys.toml`). Without `--print-only`, `keygen` appends to the keys file directly, which only works where the file is writable, such as a host install.
+- `keys.toml` belongs to the operator and is mounted read-only in the container. The server only reads it, so a compromised server cannot mint itself a key.
 - The running server picks up changes to `keys.toml` within a few seconds (inotify plus a 2 second poll, so Docker bind mounts work) and on `SIGHUP`.
 - Rotate a client key: `keygen` a new one, hand it out, and once the logs show the new name delete the old entry or set `disabled = true`. Reload is automatic and clears the verify cache, so revocation is immediate.
 - Rotate a repo credential: create the new key or token with the same scope, overwrite the secret file (next fetch uses it) or restart for an env var, confirm `status` shows `last_success` moving, then revoke the old one on the host.
@@ -228,7 +229,7 @@ Upgrading: read the release notes, pull the new image, run `docker compose run -
 | 401 from `/mcp` | Missing or wrong key, expired or disabled entry, or a keys file that failed to reload (see `keys.reload_error` in `/readyz`). |
 | 429 from `/mcp` | Too many failed attempts from that client IP. Wait for `Retry-After`. If every client shows the same IP, your proxy is not in `trusted_proxies`. |
 | 403 from `/mcp` | A browser `Origin` not in `server.allowed_origins`. |
-| `keygen` fails with permission denied | The bind-mounted `keys.toml` is not writable by uid 10001. `chmod 666 keys.toml`, or use `keygen --print-only` and paste the block. |
+| `keygen` fails with permission denied | The keys file is read-only to the server on purpose. Use `keygen --print-only >> keys.toml` on the host instead. |
 | `docker compose up` says the pool overlaps | Another network already uses `172.30.0.0/24`. Set `EDGE_SUBNET` in `.env` and `server.trusted_proxies` to a free range. |
 | `busy` or `timeout` | The worker cap or a subprocess timeout. Narrow the search with `path`, `glob` or `type`, or raise the limits. |
 | SSH fetch fails with a host key error | The host's key is not in `pull.known_hosts_file`. The image ships github.com and bitbucket.org; mount your own file for others. |
