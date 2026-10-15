@@ -55,7 +55,7 @@ Checklist for the v1 build. Kept current so a restart loses nothing. Spec: the o
 - [x] Fixes applied, proof re-run, docs/REVIEW.md written
 
 ## Phase 8: leak scan and publish
-- [ ] gitleaks over the tree and the full history
-- [ ] grep for personal data, hostnames, IPs, local paths, machine names, client names
-- [ ] `gh repo create matpb/code-explorer-mcp --public`, push, local check script green
-- [ ] Final report to the owner
+- [x] gitleaks over the tree and the full history
+- [x] grep for personal data, hostnames, IPs, local paths, machine names, client names
+- [x] `gh repo create matpb/code-explorer-mcp --public`, push, local check script green
+- [x] Final report to the owner
