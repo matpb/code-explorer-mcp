@@ -61,7 +61,7 @@ mod tests {
         let secret_d = format!("ATCT{}", "y-_".repeat(8));
         let secret_e = format!("ATATT{}", "z".repeat(30));
         let secret_f = format!("cex_abcdefgh_{}", "Q".repeat(43));
-        let secret_g = "a1B2c3D4e5F6g7H8i9J0".repeat(3);
+        let secret_g = "x9".repeat(30);
         for secret in [
             secret_a, secret_b, secret_c, secret_d, secret_e, secret_f, secret_g,
         ] {

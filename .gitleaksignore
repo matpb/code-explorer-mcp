@@ -1,0 +1,2 @@
+# Synthetic test fixture in the stderr scrubbing test, not a credential.
+d27fc48926e6c3f1eb55a96ccee86f3b24ce7c89:src/git/scrub.rs:generic-api-key:64
