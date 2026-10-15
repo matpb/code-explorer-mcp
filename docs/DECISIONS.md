@@ -1,0 +1,30 @@
+# Decisions
+
+Answers to the spec's open questions, plus implementation choices made while building. Each entry says what was chosen and why. Entries are append-only.
+
+## From the spec's open questions
+
+1. **Name and license.** Crate `code-explorer-mcp` (the name `code-explorer` is taken on crates.io), binary `code-explorer`, GitHub repo `code-explorer-mcp`. License MIT.
+2. **Worker cap vs per-key throttling.** v1 has a global concurrency cap only, as the spec recommends. No per-key limit, not even optional. Authenticated traffic is never rate limited.
+3. **Key hashing.** argon2id kept (m=19456 KiB, t=2, p=1), with the 10 minute verified-key cache so the cost is paid once per key per window.
+4. **History depth.** Default 200 commits.
+5. **Author emails.** Off by default (`logging.author_emails = false`).
+6. **Staleness.** A stale snapshot is a notice on results, never a refusal. No hard cutoff.
+7. **Repo ids as an enum per key.** Kept. `tools/list` injects the caller's allowed repo ids as an enum on every `repo` and `repos` parameter.
+8. **Legacy protocol window.** Clients on 2025-11-25 and earlier are served without sessions through rmcp's compatibility mode. No drop date in v1.
+9. **Templates such as `.env.example`.** Denied by default. Operators carve exceptions with `[deny] allow`.
+10. **Image distribution and signing.** v1 ships the Dockerfile and compose files. CI builds the image to prove it builds but does not push. Registry publishing, signing and SBOM are later work.
+11. **Bitbucket plan check.** Operator responsibility, documented in the README: repository access tokens may be unavailable on some plans, in which case SSH access keys are the fallback.
+
+## Implementation choices
+
+- **MCP SDK.** rmcp 3.5 with `transport-streamable-http-server`, mounted in axum as a Tower service. Stateless (`NeverSessionManager`), `legacy_session_mode = false`, `json_response = true`. rmcp's own Host and Origin checks are disabled; the server enforces Origin itself so the rule lives in one place and applies before auth.
+- **Authentication context.** The axum auth middleware inserts an `AuthContext` into the HTTP request extensions. rmcp copies `http::request::Parts` into the MCP request extensions, so every tool reads the key name and allow-list from `ctx.extensions`. A tool call without an `AuthContext` fails closed with an internal error.
+- **Per-key tool list.** `ServerHandler::list_tools` is written by hand: it takes the router's tool list and rewrites the `repo` and `repos` schemas with the caller's repo ids as an enum.
+- **Config error reporting.** Syntax and unknown-field errors come from `toml` with their span. Semantic problems are collected into a list and each is given a line number by looking the key path up in a `toml_edit` document parsed from the same text.
+- **Credentials and git.** HTTPS tokens reach git through `GIT_ASKPASS` pointing at the server binary itself (`code-explorer askpass`, a hidden subcommand). The helper reads the secret from a file named in `CODE_EXPLORER_ASKPASS_FILE`. Credentials given by env var are written once at start to a 0600 file in a private temp dir so the same path is used. SSH keys use `GIT_SSH_COMMAND` with `IdentitiesOnly=yes`, `StrictHostKeyChecking=yes`, `BatchMode=yes` and a pinned `known_hosts` file.
+- **Subprocess safety.** Every `git`, `rg` and `gitleaks` child runs with a cleared environment, in its own process group, under a timeout; on expiry the whole group is killed. A global semaphore caps concurrent children.
+- **Snapshot cleanup.** A `Snapshot` removes its worktree directory when the last reference to it is dropped, so in-flight calls always finish on the snapshot they started with.
+- **Scanner.** gitleaks `dir` mode over the new worktree plus a file holding the commit messages of the kept history. Secret values live only in memory, inside the redactor.
+- **Durations.** `humantime` syntax in TOML (`"5m"`, `"30s"`, `"2h"`).
+- **Metrics.** The `prometheus` crate with a dedicated registry served as text on the admin listener.

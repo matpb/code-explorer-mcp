@@ -1,0 +1,77 @@
+[package]
+name = "code-explorer-mcp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/matpb/code-explorer-mcp"
+description = "Read-only MCP server that lets AI agents explore GitHub and Bitbucket repos from local shallow clones: tree, glob, read, grep, log"
+keywords = ["mcp", "mcp-server", "git", "code-search", "ai"]
+categories = ["command-line-utilities", "development-tools", "web-programming"]
+exclude = ["/deploy", "/docs", "/.github", "/scripts"]
+
+[[bin]]
+name = "code-explorer"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "3.5", features = ["server", "macros", "transport-streamable-http-server"] }
+schemars = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["limit", "timeout", "trace"] }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+toml_edit = "0.25"
+clap = { version = "4", features = ["derive", "env"] }
+argon2 = "0.6"
+rand = "0.10"
+base64 = "0.23"
+data-encoding = "2"
+sha2 = "0.11"
+subtle = "2"
+aho-corasick = "1"
+globset = "0.4"
+ipnet = "2"
+lru = "0.18"
+notify = "8"
+prometheus = { version = "0.14", default-features = false }
+arc-swap = "1"
+humantime = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+thiserror = "2"
+anyhow = "1"
+tempfile = "3"
+nix = { version = "0.31", features = ["signal", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+regex-syntax = "0.8"
+futures = "0.3"
+bytes = "1"
+
+[dev-dependencies]
+rmcp = { version = "3.5", features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1

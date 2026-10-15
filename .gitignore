@@ -1,0 +1,9 @@
+/target
+/config.toml
+/keys.toml
+/secrets/
+/deploy/secrets/
+/deploy/.env
+/deploy/config.toml
+/deploy/keys.toml
+*.local.toml
