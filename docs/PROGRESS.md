@@ -58,4 +58,4 @@ Checklist for the v1 build. Kept current so a restart loses nothing. Spec: the o
 - [ ] gitleaks over the tree and the full history
 - [ ] grep for personal data, hostnames, IPs, local paths, machine names, client names
 - [ ] `gh repo create matpb/code-explorer-mcp --public`, push, local check script green
-- [ ] Final crew_notify to Mat and summary to cortex
+- [ ] Final report to the owner

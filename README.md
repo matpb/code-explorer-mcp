@@ -31,7 +31,7 @@ Requirements on the host: Docker with Compose, a DNS name pointing at the host (
 ```sh
 git clone https://github.com/matpb/code-explorer-mcp.git
 cd code-explorer-mcp/deploy
-cp .env.example .env            # set DOMAIN; change EDGE_SUBNET and CADDY_IP if 172.30.0.0/24 is taken on this host
+cp .env.example .env            # set DOMAIN; change EDGE_SUBNET, EDGE_IP_RANGE and CADDY_IP if 172.30.0.0/24 is taken on this host
 cp ../config.example.toml config.toml
 mkdir -p secrets && touch keys.toml
 # put each repo's SSH private key (or token) in secrets/, see "Onboarding a repo"
@@ -233,7 +233,7 @@ Upgrading: read the release notes, pull the new image, run `docker compose run -
 | 429 from `/mcp` | Too many failed attempts from that client IP. Wait for `Retry-After`. If every client shows the same IP, your proxy is not in `trusted_proxies`. |
 | 403 from `/mcp` | A browser `Origin` not in `server.allowed_origins`. |
 | `keygen` fails with permission denied | The keys file is read-only to the server on purpose. Use `keygen --print-only >> keys.toml` on the host instead. |
-| `docker compose up` says the pool overlaps | Another network already uses `172.30.0.0/24`. Set `EDGE_SUBNET` in `.env` and `server.trusted_proxies` to a free range. |
+| `docker compose up` says the pool overlaps | Another network already uses `172.30.0.0/24`. Set `EDGE_SUBNET`, `EDGE_IP_RANGE` and `CADDY_IP` in `.env` to a free range, and `server.trusted_proxies` to the new `CADDY_IP/32`. |
 | `busy` or `timeout` | The worker cap or a subprocess timeout. Narrow the search with `path`, `glob` or `type`, or raise the limits. |
 | SSH fetch fails with a host key error | The host's key is not in `pull.known_hosts_file`. The image ships github.com and bitbucket.org; mount your own file for others. |
 

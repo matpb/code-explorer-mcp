@@ -54,6 +54,7 @@ networks:
     ipam:
       config:
         - subnet: ${EDGE_SUBNET:-172.30.0.0/24}
+          ip_range: ${EDGE_IP_RANGE:-172.30.0.128/25}
 
 volumes:
   explorer-data: {}
