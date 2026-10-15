@@ -18,17 +18,17 @@ Checklist for the v1 build. Kept current so a restart loses nothing. Spec: the o
 - [x] Unit tests for each, `cargo clippy -D warnings` clean
 
 ## Phase 2: snapshots, scan, auth
-- [ ] `snapshot`: FileIndex from ls-tree, Snapshot, RepoState, Registry, state.json
-- [ ] `puller`: first start, tick loop, backoff, atomic swap, cleanup
-- [ ] `scan`: Scanner trait, gitleaks adapter, policies redact/warn/block, allowlist, on_scan_error hold
-- [ ] `auth`: client IP derivation, failed-auth throttle (LRU, backoff, 429), bearer verify, AuthContext
-- [ ] Unit tests
+- [x] `snapshot`: FileIndex from ls-tree, Snapshot, RepoState, Registry, state.json
+- [x] `puller`: first start, tick loop, backoff, atomic swap, cleanup
+- [x] `scan`: Scanner trait, gitleaks adapter, policies redact/warn/block, allowlist, on_scan_error hold
+- [x] `auth`: client IP derivation, failed-auth throttle (LRU, backoff, 429), bearer verify, AuthContext
+- [x] Unit tests
 
 ## Phase 3: tools, HTTP, metrics, logging, CLI
 - [ ] `tools`: list_repos, list_tree, glob, read_file, grep, log (+ blame, file at commit behind features), envelope, notices, typed errors, text rendering, output caps, permalinks
 - [ ] per-key `list_tools` with repo enums
 - [ ] `http`: public /mcp + /healthz with Origin check, body limit, timeouts; admin /readyz + /metrics
-- [ ] `metrics`, `logging` (JSON tool_call events, shape vs full)
+- [x] `metrics`, `logging` (JSON tool_call events, shape vs full)
 - [ ] CLI: serve, check-config [--probe], keygen, scan --repo, status, healthcheck, askpass (hidden)
 
 ## Phase 4: integration tests

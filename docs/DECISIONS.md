@@ -28,3 +28,8 @@ Answers to the spec's open questions, plus implementation choices made while bui
 - **Scanner.** gitleaks `dir` mode over the new worktree plus a file holding the commit messages of the kept history. Secret values live only in memory, inside the redactor.
 - **Durations.** `humantime` syntax in TOML (`"5m"`, `"30s"`, `"2h"`).
 - **Metrics.** The `prometheus` crate with a dedicated registry served as text on the admin listener.
+- **Scanner hardening.** gitleaks honours `.gitleaks.toml`, `.gitleaksignore` and `gitleaks:allow` comments found in the scanned tree, which would let a repo hide its own findings. The adapter always passes its own default ruleset with `--config`, an empty `--gitleaks-ignore-path` and `--ignore-gitleaks-allow`.
+- **Scan runs.** gitleaks does not follow a symlinked directory, so the worktree and the commit-message file are scanned in two parallel runs and the findings merged. Commit-message fingerprints are `commit_messages:<rule>:<line>`.
+- **Remote URL refresh.** The bare repo keeps the clone-time origin URL, so the puller runs `git remote set-url origin` before every fetch and a config change to path, host or credential type takes effect at the next tick.
+- **Clone staging.** A clone lands in `git.clone/` and is renamed to `git/` on success, so a crash mid-clone leaves nothing a later fetch would trip on.
+- **state.json trust.** On restore, a worktree path outside `snapshots/` or containing `..` is rejected. Stored findings go through the allowlist again, and a repo under the block policy is rescanned.
