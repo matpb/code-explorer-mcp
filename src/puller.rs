@@ -66,9 +66,9 @@ impl ResolvedCreds {
         Ok(ResolvedCreds { map, _files: files })
     }
 
-    /// Unknown names resolve to no credential, which makes git fail with an auth error.
-    pub fn get(&self, name: &str) -> &ResolvedCredential {
-        self.map.get(name).unwrap_or(&NO_CREDENTIAL)
+    /// No name (anonymous repo) or an unknown name resolves to no credential.
+    pub fn get(&self, name: Option<&str>) -> &ResolvedCredential {
+        name.and_then(|n| self.map.get(n)).unwrap_or(&NO_CREDENTIAL)
     }
 }
 
@@ -295,13 +295,17 @@ pub async fn pull_once(
 async fn pull_inner(deps: &PullerDeps, state: &Arc<RepoState>) -> Result<PullOutcome, PullError> {
     let cfg = &state.cfg;
     let dirs = data_layout(&deps.config.server.data_dir, &cfg.id);
-    let credential = deps
-        .config
-        .credentials
-        .get(&cfg.credential)
-        .ok_or_else(|| internal(format!("unknown credential {:?}", cfg.credential)))?;
+    let credential = match cfg.credential.as_deref() {
+        Some(name) => Some(
+            deps.config
+                .credentials
+                .get(name)
+                .ok_or_else(|| internal(format!("unknown credential {name:?}")))?,
+        ),
+        None => None,
+    };
     let url = cfg.remote_url(credential);
-    let cred = deps.creds.get(&cfg.credential);
+    let cred = deps.creds.get(cfg.credential.as_deref());
     let depth = deps.config.pull.depth;
 
     if dirs.git.join("HEAD").exists() {
@@ -1126,7 +1130,7 @@ mod tests {
             .unwrap()
             .config;
         let creds = ResolvedCreds::prepare(&cfg).unwrap();
-        match creds.get("file") {
+        match creds.get(Some("file")) {
             ResolvedCredential::HttpsToken {
                 username,
                 secret_path,
@@ -1136,7 +1140,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        match creds.get("envc") {
+        match creds.get(Some("envc")) {
             ResolvedCredential::HttpsToken { secret_path, .. } => {
                 assert!(secret_path.is_file());
                 assert_ne!(secret_path, &secret);
@@ -1144,9 +1148,9 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            creds.get("ssh"),
+            creds.get(Some("ssh")),
             ResolvedCredential::SshKey { key_path } if key_path == &key
         ));
-        assert!(matches!(creds.get("nope"), ResolvedCredential::None));
+        assert!(matches!(creds.get(Some("nope")), ResolvedCredential::None));
     }
 }

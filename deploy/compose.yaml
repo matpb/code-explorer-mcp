@@ -19,10 +19,10 @@ services:
       - ./keys.toml:/etc/code-explorer/keys.toml
       - explorer-data:/data
     secrets:
-      - web_ui_token
-      - design_system_key
+      - web_ui_key
+      - api_key
     environment:
-      API_REPO_TOKEN: ${API_REPO_TOKEN:-}
+      DESIGN_SYSTEM_TOKEN: ${DESIGN_SYSTEM_TOKEN:-}
     ports:
       - "${EXPLORER_BIND:-127.0.0.1}:${EXPLORER_PORT:-8080}:8080"
     networks:
@@ -61,7 +61,7 @@ volumes:
   caddy-config: {}
 
 secrets:
-  web_ui_token:
-    file: ./secrets/web_ui_token
-  design_system_key:
-    file: ./secrets/design_system_key
+  web_ui_key:
+    file: ./secrets/web_ui_key
+  api_key:
+    file: ./secrets/api_key

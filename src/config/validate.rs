@@ -366,7 +366,11 @@ fn name_ok(name: &str) -> bool {
 }
 
 fn credentials(c: &mut Ctx, cfg: &Config) {
-    let referenced: BTreeSet<&str> = cfg.repo.iter().map(|r| r.credential.as_str()).collect();
+    let referenced: BTreeSet<&str> = cfg
+        .repo
+        .iter()
+        .filter_map(|r| r.credential.as_deref())
+        .collect();
     let today = chrono::Utc::now().date_naive();
     for (name, cred) in &cfg.credentials {
         let base = format!("credentials.{name}");
@@ -447,7 +451,7 @@ fn check_env(c: &mut Ctx, key: &str, var: &str) {
         c.err(
             key,
             format!("{var:?} is not a valid environment variable name"),
-            "use a name such as API_REPO_TOKEN",
+            "use a name such as DESIGN_SYSTEM_TOKEN",
         );
         return;
     }
@@ -576,12 +580,21 @@ fn repos(c: &mut Ctx, cfg: &Config) {
                 "use a valid git branch name such as \"main\"",
             );
         }
-        if !cfg.credentials.contains_key(&r.credential) {
-            c.err(
+        match &r.credential {
+            Some(name) if !cfg.credentials.contains_key(name) => c.err(
                 &k("credential"),
-                format!("credential {:?} is not defined", r.credential),
+                format!("credential {name:?} is not defined"),
                 "add a [credentials.<name>] table with that name, or fix the reference",
-            );
+            ),
+            Some(_) => {}
+            None => c.warn(
+                &k("credential"),
+                format!(
+                    "repo {} has no credential: only public repos can be read anonymously",
+                    r.id
+                ),
+                "set credential = \"<name>\" for a private repo",
+            ),
         }
         if let Some(iv) = r.pull_interval {
             c.min_duration(&k("pull_interval"), iv, MIN_PULL_INTERVAL);

@@ -65,21 +65,20 @@ author_emails = false                        # log tool returns author names onl
 [metrics]
 enabled = true                               # Prometheus text on admin_listen /metrics
 
-# Credentials are referenced by name. Values never live in this file.
-[credentials.web-ui-token]
-type        = "https_token"                  # GitHub fine-grained PAT
-username    = "token-owner-username"         # GitHub: the token owner's username
-secret_file = "/run/secrets/web_ui_token"    # re-read on every fetch
-expires     = "2099-04-15"                   # optional; used to warn before the token lapses
+# Credentials are referenced by name. Values never live in this file. SSH keys are the recommended default.
+[credentials.web-ui-key]
+type        = "ssh_key"                      # GitHub deploy key (read-only) on example-org/web-ui
+secret_file = "/run/secrets/web_ui_key"      # private key file; re-read on every fetch
 
-[credentials.api-token]
-type     = "https_token"                     # Bitbucket repository access token
-username = "x-token-auth"                    # fixed value for Bitbucket repository tokens
-env      = "API_REPO_TOKEN"                  # read once at start; rotation needs a restart
+[credentials.api-key]
+type        = "ssh_key"                      # Bitbucket repository access key (read-only) on example-workspace/api
+secret_file = "/run/secrets/api_key"
 
-[credentials.design-system-key]
-type        = "ssh_key"                      # GitHub deploy key or Bitbucket access key
-secret_file = "/run/secrets/design_system_key"
+[credentials.design-system-token]
+type     = "https_token"                     # GitHub fine-grained personal access token (Contents: read-only)
+username = "token-owner-username"            # the token owner's GitHub username
+env      = "DESIGN_SYSTEM_TOKEN"             # read once at start; rotation needs a restart
+expires  = "2099-04-15"                      # optional; used to warn before the token lapses
 
 [[repo]]
 id          = "web-ui"                       # [a-z0-9][a-z0-9._-]{0,62}, unique
@@ -87,7 +86,7 @@ host        = "github"                       # github | bitbucket
 path        = "example-org/web-ui"           # owner/name or workspace/name
 branch      = "main"                         # exactly one
 description = "Customer web app (React). Shared UI components in src/components."
-credential  = "web-ui-token"
+credential  = "web-ui-key"
 
 [[repo]]
 id          = "api"
@@ -95,7 +94,7 @@ host        = "bitbucket"
 path        = "example-workspace/api"
 branch      = "production"
 description = "Backend API as deployed. Routes in routes/, request rules in app/Http/Requests."
-credential  = "api-token"
+credential  = "api-key"
 pull_interval = "2m"                         # per-repo override
 
 [[repo]]
@@ -104,7 +103,7 @@ host        = "bitbucket"
 path        = "example-workspace/api"
 branch      = "develop"
 description = "Backend API, integration branch. Not deployed."
-credential  = "api-token"
+credential  = "api-key"
 
 [[repo]]
 id          = "design-system"
@@ -112,5 +111,5 @@ host        = "github"
 path        = "example-org/design-system"
 branch      = "main"
 description = "Design tokens and base components."
-credential  = "design-system-key"
+credential  = "design-system-token"
 scan_policy = "block"                        # per-repo override

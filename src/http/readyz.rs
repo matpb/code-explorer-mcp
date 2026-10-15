@@ -69,7 +69,11 @@ pub fn expiry_days(expires: NaiveDate, today: NaiveDate) -> i64 {
 }
 
 pub(super) fn credential_days(st: &AdminState, repo: &RepoState, today: NaiveDate) -> Option<i64> {
-    let expires = st.cfg.credentials.get(&repo.cfg.credential)?.expires()?;
+    let expires = st
+        .cfg
+        .credentials
+        .get(repo.cfg.credential.as_deref()?)?
+        .expires()?;
     Some(expiry_days(expires, today))
 }
 

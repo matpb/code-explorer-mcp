@@ -69,7 +69,7 @@ fn line_in(text: &str, needle: &str) -> usize {
 }
 
 fn example_text(fx: &Fx) -> String {
-    let key = fx.dir.path().join("design_key");
+    let key = fx.dir.path().join("api_key");
     let known = fx.dir.path().join("known_hosts");
     std::fs::write(&key, "not-a-real-key\n").expect("write key");
     std::fs::write(&known, "example.com ssh-ed25519 AAAA\n").expect("write known_hosts");
@@ -78,8 +78,8 @@ fn example_text(fx: &Fx) -> String {
             .expect("example config");
     for (from, to) in [
         ("/data", fx.data()),
-        ("/run/secrets/web_ui_token", fx.secret.clone()),
-        ("/run/secrets/design_system_key", key),
+        ("/run/secrets/web_ui_key", fx.secret.clone()),
+        ("/run/secrets/api_key", key),
         ("/etc/code-explorer/known_hosts", known),
     ] {
         text = text.replace(
@@ -111,7 +111,8 @@ fn minimal_config_loads_with_defaults() {
 fn example_config_loads() {
     let fx = Fx::new();
     let text = example_text(&fx);
-    let loaded = load_env(&text, &[("API_REPO_TOKEN", "not-a-real-token")]).expect("example loads");
+    let loaded =
+        load_env(&text, &[("DESIGN_SYSTEM_TOKEN", "not-a-real-token")]).expect("example loads");
     assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
     let c = &loaded.config;
     assert_eq!(c.repo.len(), 4);
@@ -123,7 +124,15 @@ fn example_config_loads() {
     );
     let ds = c.repo("design-system").expect("ds");
     assert_eq!(ds.scan_policy_or(c.scan.policy), ScanPolicy::Block);
-    assert!(c.credential_for(ds).is_ssh());
+    assert!(c.credential_for(ds).is_some_and(|c| !c.is_ssh()));
+    assert!(
+        c.credential_for(c.repo("api").expect("api"))
+            .is_some_and(Credential::is_ssh)
+    );
+    assert!(
+        c.credential_for(c.repo("api-next").expect("api-next"))
+            .is_some_and(Credential::is_ssh)
+    );
     assert_eq!(c.scan.allowlist, vec!["a1b2c3d4e5f6".to_string()]);
 }
 
@@ -133,10 +142,10 @@ fn example_config_reports_missing_env_var() {
     let text = example_text(&fx);
     let p = errs(load(&text));
     assert_eq!(p.len(), 1);
-    assert_eq!(p[0].key, "credentials.api-token.env");
+    assert_eq!(p[0].key, "credentials.design-system-token.env");
     assert_eq!(
         p[0].line,
-        Some(line_in(&text, "env      = \"API_REPO_TOKEN\""))
+        Some(line_in(&text, "env      = \"DESIGN_SYSTEM_TOKEN\""))
     );
 }
 
@@ -420,23 +429,26 @@ fn remote_url_forms() {
     };
     let mut gh = cfg.repo[0].clone();
     assert_eq!(
-        gh.remote_url(&https),
+        gh.remote_url(Some(&https)),
         "https://github.com/example-org/a.git"
     );
-    assert_eq!(gh.remote_url(&ssh), "git@github.com:example-org/a.git");
+    assert_eq!(
+        gh.remote_url(Some(&ssh)),
+        "git@github.com:example-org/a.git"
+    );
     gh.host = Host::Bitbucket;
     gh.path = "example-workspace/api".into();
     assert_eq!(
-        gh.remote_url(&https),
+        gh.remote_url(Some(&https)),
         "https://bitbucket.org/example-workspace/api.git"
     );
     assert_eq!(
-        gh.remote_url(&ssh),
+        gh.remote_url(Some(&ssh)),
         "git@bitbucket.org:example-workspace/api.git"
     );
     gh.remote_url_override = Some("/tmp/bare.git".into());
-    assert_eq!(gh.remote_url(&https), "/tmp/bare.git");
-    assert_eq!(gh.remote_url(&ssh), "/tmp/bare.git");
+    assert_eq!(gh.remote_url(Some(&https)), "/tmp/bare.git");
+    assert_eq!(gh.remote_url(Some(&ssh)), "/tmp/bare.git");
 }
 
 #[test]
@@ -641,4 +653,32 @@ fn binaries_check_reports_missing_and_accepts_present() {
     for x in &p {
         assert!(!x.message.contains("need at least"), "{x}");
     }
+}
+
+#[test]
+fn repo_without_credential_is_anonymous_with_warning() {
+    let fx = Fx::new();
+    let text = format!(
+        "{}{}",
+        fx.head(),
+        fx.repo("").replace("credential = \"c\"\n", "")
+    );
+    let loaded = load(&text).expect("anonymous repo loads");
+    let cfg = &loaded.config;
+    let repo = cfg.repo("a").expect("repo a");
+    assert!(repo.credential.is_none());
+    assert!(cfg.credential_for(repo).is_none());
+    assert_eq!(
+        repo.remote_url(None),
+        "https://github.com/example-org/a.git"
+    );
+    let w = loaded
+        .warnings
+        .iter()
+        .find(|w| w.key == "repo[0].credential")
+        .expect("no-credential warning");
+    assert!(
+        w.message
+            .contains("only public repos can be read anonymously")
+    );
 }

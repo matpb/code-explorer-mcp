@@ -399,7 +399,9 @@ pub struct RepoConfig {
     pub branch: String,
     #[serde(default)]
     pub description: String,
-    pub credential: String,
+    /// None means anonymous HTTPS access to a public repo.
+    #[serde(default)]
+    pub credential: Option<String>,
     #[serde(default, deserialize_with = "duration::option::deserialize")]
     pub pull_interval: Option<Duration>,
     #[serde(default)]
@@ -419,12 +421,12 @@ impl RepoConfig {
     }
 
     /// Remote URL without credentials; SSH credentials get the scp-like form.
-    pub fn remote_url(&self, cred: &Credential) -> String {
+    pub fn remote_url(&self, cred: Option<&Credential>) -> String {
         if let Some(url) = &self.remote_url_override {
             return url.clone();
         }
         let domain = self.host.domain();
-        if cred.is_ssh() {
+        if cred.is_some_and(Credential::is_ssh) {
             format!("git@{domain}:{}.git", self.path)
         } else {
             format!("https://{domain}/{}.git", self.path)
@@ -512,13 +514,14 @@ impl Config {
         self.repo.iter().find(|r| r.id == id)
     }
 
-    /// Panics only if called on a config that skipped validation and names a missing credential.
-    pub fn credential_for(&self, repo: &RepoConfig) -> &Credential {
-        match self.credentials.get(&repo.credential) {
-            Some(c) => c,
+    /// None for an anonymous repo. Panics only if a skipped validation left a dangling reference.
+    pub fn credential_for(&self, repo: &RepoConfig) -> Option<&Credential> {
+        let name = repo.credential.as_deref()?;
+        match self.credentials.get(name) {
+            Some(c) => Some(c),
             None => panic!(
-                "repo {:?} references unknown credential {:?}; validation should have rejected it",
-                repo.id, repo.credential
+                "repo {:?} references unknown credential {name:?}; validation should have rejected it",
+                repo.id
             ),
         }
     }

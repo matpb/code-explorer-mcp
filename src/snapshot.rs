@@ -677,7 +677,7 @@ mod tests {
             path: "example-org/x".into(),
             branch: "main".into(),
             description: String::new(),
-            credential: "c".into(),
+            credential: Some("c".into()),
             pull_interval: None,
             scan_policy: None,
             remote_url_override: None,
