@@ -113,7 +113,7 @@ Authenticated traffic is never rate limited. A global worker cap bounds subproce
 | `pull.depth` | `200` | Commits of history kept; bounds `log` and `blame`. |
 | `pull.fetch_timeout`, `pull.clone_timeout` | `2m`, `10m` | |
 | `pull.stale_after` | `30m` | No successful pull for this long: results carry `stale_snapshot`. |
-| `pull.known_hosts_file` | `/etc/code-explorer/known_hosts` | Pinned host keys for SSH. The image ships github.com and bitbucket.org. |
+| `pull.known_hosts_file` | `/etc/code-explorer/known_hosts` | Pinned host keys for SSH. The image ships github.com, bitbucket.org and ssh.bitbucket.org (Bitbucket Cloud's SSH host from November 12, 2026). |
 
 ### Scan, deny-list, features, logging, metrics
 
@@ -235,7 +235,7 @@ Upgrading: read the release notes, pull the new image, run `docker compose run -
 | `keygen` fails with permission denied | The keys file is read-only to the server on purpose. Use `keygen --print-only >> keys.toml` on the host instead. |
 | `docker compose up` says the pool overlaps | Another network already uses `172.30.0.0/24`. Set `EDGE_SUBNET`, `EDGE_IP_RANGE` and `CADDY_IP` in `.env` to a free range, and `server.trusted_proxies` to the new `CADDY_IP/32`. |
 | `busy` or `timeout` | The worker cap or a subprocess timeout. Narrow the search with `path`, `glob` or `type`, or raise the limits. |
-| SSH fetch fails with a host key error | The host's key is not in `pull.known_hosts_file`. The image ships github.com and bitbucket.org; mount your own file for others. |
+| SSH fetch fails with a host key error | The host's key is not in `pull.known_hosts_file`. The image ships github.com, bitbucket.org and ssh.bitbucket.org; mount your own file for others. |
 
 ## Development
 

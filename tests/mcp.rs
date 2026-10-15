@@ -1763,7 +1763,8 @@ async fn scan_policies_redact_warn_and_block() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn parallel_greps_succeed_or_report_busy() {
-    let c = tight_server().full().await;
+    let mut c = tight_server().full().await;
+    c.keep_busy = true;
     let calls = (0..20).map(|i| {
         let c = &c;
         async move {

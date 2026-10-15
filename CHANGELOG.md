@@ -15,3 +15,4 @@ All notable changes to this project are documented here. The format follows Keep
 - JSON request logs per key, `/healthz`, `/readyz`, Prometheus metrics.
 - Docker image and compose files with a Caddy profile and a gateway mode.
 - Redaction at rest: under the `redact` policy, found secret values are replaced inside the snapshot files before anything is served.
+- Bitbucket SSH remotes use `ssh.bitbucket.org`, the host Bitbucket Cloud serves Git over SSH from as of November 12, 2026; the shipped `known_hosts` covers it.

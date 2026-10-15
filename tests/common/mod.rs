@@ -507,6 +507,8 @@ impl Server {
 /// A connected rmcp client for one key.
 pub struct Mcp {
     pub svc: RunningService<RoleClient, ClientConfig>,
+    /// When set, a busy answer is returned as is instead of being retried.
+    pub keep_busy: bool,
 }
 
 impl Mcp {
@@ -519,7 +521,10 @@ impl Mcp {
             .serve(transport)
             .await
             .expect("mcp initialize");
-        Mcp { svc }
+        Mcp {
+            svc,
+            keep_busy: false,
+        }
     }
 
     pub async fn tools(&self) -> Vec<Value> {
@@ -534,14 +539,24 @@ impl Mcp {
         let Value::Object(map) = args else {
             panic!("arguments must be a JSON object");
         };
-        let params = CallToolRequestParams::new(name.to_owned()).with_arguments(map);
-        let result = self
-            .svc
-            .call_tool(params)
-            .await
-            .unwrap_or_else(|e| panic!("protocol error calling {name}: {e}"));
-        Reply {
-            raw: serde_json::to_value(&result).expect("result json"),
+        let mut attempts = 0;
+        loop {
+            let params = CallToolRequestParams::new(name.to_owned()).with_arguments(map.clone());
+            let result = self
+                .svc
+                .call_tool(params)
+                .await
+                .unwrap_or_else(|e| panic!("protocol error calling {name}: {e}"));
+            let reply = Reply {
+                raw: serde_json::to_value(&result).expect("result json"),
+            };
+            // Shared tight servers can answer busy while a parallel test holds every worker.
+            if reply.error_code() == Some("busy") && attempts < 5 && !self.keep_busy {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            return reply;
         }
     }
 }

@@ -546,7 +546,7 @@ fn remote_url_forms() {
     );
     assert_eq!(
         gh.remote_url(Some(&ssh)),
-        "git@bitbucket.org:example-workspace/api.git"
+        "git@ssh.bitbucket.org:example-workspace/api.git"
     );
     gh.remote_url_override = Some("/tmp/bare.git".into());
     assert_eq!(gh.remote_url(Some(&https)), "/tmp/bare.git");

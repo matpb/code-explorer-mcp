@@ -103,6 +103,14 @@ impl Host {
             Host::Bitbucket => "bitbucket.org",
         }
     }
+
+    /// Host for Git over SSH. Bitbucket Cloud serves SSH from ssh.bitbucket.org from 2026-11-12.
+    pub fn ssh_host(self) -> &'static str {
+        match self {
+            Host::Github => "github.com",
+            Host::Bitbucket => "ssh.bitbucket.org",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -432,11 +440,10 @@ impl RepoConfig {
         if let Some(url) = &self.remote_url_override {
             return url.clone();
         }
-        let domain = self.host.domain();
         if cred.is_some_and(Credential::is_ssh) {
-            format!("git@{domain}:{}.git", self.path)
+            format!("git@{}:{}.git", self.host.ssh_host(), self.path)
         } else {
-            format!("https://{domain}/{}.git", self.path)
+            format!("https://{}/{}.git", self.host.domain(), self.path)
         }
     }
 }
