@@ -1,0 +1,116 @@
+# config.toml: placeholder values only. Never commit the real one.
+version = 1                                  # schema version; the server refuses unknown versions
+
+[server]
+listen        = "0.0.0.0:8080"               # public listener: /mcp and /healthz
+admin_listen  = "0.0.0.0:9090"               # /readyz and /metrics; do not publish this port
+public_url    = "https://explorer.example.com"
+allowed_origins = []                         # browser origins allowed; a present Origin not listed gets 403
+trusted_proxies = ["172.30.0.0/24"]          # only these peers may set the client IP header
+client_ip_header = "X-Forwarded-For"         # or a single-value header your gateway sets; "" ignores client IP headers
+data_dir      = "/data"
+# git_path = "/usr/bin/git"                  # optional overrides when the binaries are not on PATH
+# rg_path  = "/usr/bin/rg"
+
+[auth]
+keys_file = "/etc/code-explorer/keys.toml"   # watched; reloaded on change or SIGHUP
+
+[auth.failed_attempts]                       # per client IP; authenticated traffic is never rate limited
+max_failures = 5
+window       = "10m"
+base_backoff = "2s"                          # doubles per further failure
+max_backoff  = "15m"
+ipv6_prefix  = 64                            # IPv6 clients are grouped by /64
+
+[limits]
+max_response_bytes     = 262144              # 256 KiB per tool result, after rendering
+max_file_bytes         = 4194304             # read_file refuses larger files (4 MiB)
+max_line_chars         = 2000                # longer lines are cut with a marker
+max_concurrent_workers = 16                  # rg/git subprocesses at once, across all keys
+queue_timeout          = "5s"                # wait for a worker slot, then error "busy"
+rg_timeout             = "10s"
+git_timeout            = "10s"               # log, ls-tree, show
+
+[pull]
+interval    = "5m"                           # default; per-repo override allowed
+jitter      = "30s"
+depth       = 200                            # commits of history kept; bounds log and blame
+fetch_timeout = "2m"
+clone_timeout = "10m"
+stale_after = "30m"                          # no successful pull for this long: results carry a stale notice
+known_hosts_file = "/etc/code-explorer/known_hosts"  # pinned host keys, required for ssh_key credentials
+
+[scan]
+engine        = "gitleaks"                   # binary shipped in the image
+# engine_path = "/usr/local/bin/gitleaks"    # optional override when not on PATH
+policy        = "redact"                     # redact | warn | block; per-repo override allowed
+on_scan_error = "hold"                       # hold = keep previous snapshot; serve = swap with a warning
+timeout       = "5m"
+allowlist     = ["a1b2c3d4e5f6"]             # finding fingerprints judged false positives
+
+[deny]                                       # applied to list_tree, glob, read_file, grep, log
+use_defaults = true                          # built-in list of secret-looking paths
+paths = ["config/credentials/**"]            # extra globs, matched case-insensitively
+allow = []                                   # exceptions to the defaults, e.g. "**/.env.example"
+
+[features]                                   # optional tools, off by default
+file_at_commit = false
+blame          = false
+
+[logging]
+format    = "json"                           # json | pretty
+arguments = "shape"                          # shape = paths and sizes, patterns hashed; full = log patterns too
+author_emails = false                        # log tool returns author names only unless true
+
+[metrics]
+enabled = true                               # Prometheus text on admin_listen /metrics
+
+# Credentials are referenced by name. Values never live in this file.
+[credentials.web-ui-token]
+type        = "https_token"                  # GitHub fine-grained PAT
+username    = "token-owner-username"         # GitHub: the token owner's username
+secret_file = "/run/secrets/web_ui_token"    # re-read on every fetch
+expires     = "2099-04-15"                   # optional; used to warn before the token lapses
+
+[credentials.api-token]
+type     = "https_token"                     # Bitbucket repository access token
+username = "x-token-auth"                    # fixed value for Bitbucket repository tokens
+env      = "API_REPO_TOKEN"                  # read once at start; rotation needs a restart
+
+[credentials.design-system-key]
+type        = "ssh_key"                      # GitHub deploy key or Bitbucket access key
+secret_file = "/run/secrets/design_system_key"
+
+[[repo]]
+id          = "web-ui"                       # [a-z0-9][a-z0-9._-]{0,62}, unique
+host        = "github"                       # github | bitbucket
+path        = "example-org/web-ui"           # owner/name or workspace/name
+branch      = "main"                         # exactly one
+description = "Customer web app (React). Shared UI components in src/components."
+credential  = "web-ui-token"
+
+[[repo]]
+id          = "api"
+host        = "bitbucket"
+path        = "example-workspace/api"
+branch      = "production"
+description = "Backend API as deployed. Routes in routes/, request rules in app/Http/Requests."
+credential  = "api-token"
+pull_interval = "2m"                         # per-repo override
+
+[[repo]]
+id          = "api-next"                     # same repo, second branch = second entry
+host        = "bitbucket"
+path        = "example-workspace/api"
+branch      = "develop"
+description = "Backend API, integration branch. Not deployed."
+credential  = "api-token"
+
+[[repo]]
+id          = "design-system"
+host        = "github"
+path        = "example-org/design-system"
+branch      = "main"
+description = "Design tokens and base components."
+credential  = "design-system-key"
+scan_policy = "block"                        # per-repo override

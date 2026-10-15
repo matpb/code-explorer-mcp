@@ -1,0 +1,67 @@
+# Code Explorer deployment. Copy .env.example to .env and edit it first.
+# COMPOSE_PROFILES=caddy (the default in .env.example) starts Caddy with automatic TLS.
+# Leave COMPOSE_PROFILES empty for gateway mode and point your own proxy at the explorer port.
+
+services:
+  explorer:
+    image: ${EXPLORER_IMAGE:-code-explorer:local}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp"]
+    volumes:
+      - ./config.toml:/etc/code-explorer/config.toml:ro
+      - ./keys.toml:/etc/code-explorer/keys.toml
+      - explorer-data:/data
+    secrets:
+      - web_ui_token
+      - design_system_key
+    environment:
+      API_REPO_TOKEN: ${API_REPO_TOKEN:-}
+    ports:
+      - "${EXPLORER_BIND:-127.0.0.1}:${EXPLORER_PORT:-8080}:8080"
+    networks:
+      edge:
+        ipv4_address: 172.30.0.10
+
+  caddy:
+    image: caddy:2@sha256:685ae3d7c34d9b5f8caeddc5d14051db7bbd88ff1f5a2fa0c16bd8ca328fb7af
+    profiles: ["caddy"]
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:-localhost}
+    ports:
+      - "${CADDY_HTTP_PORT:-80}:80"
+      - "${CADDY_HTTPS_PORT:-443}:443"
+      - "${CADDY_HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      edge:
+        ipv4_address: 172.30.0.2
+    depends_on:
+      - explorer
+
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  explorer-data: {}
+  caddy-data: {}
+  caddy-config: {}
+
+secrets:
+  web_ui_token:
+    file: ./secrets/web_ui_token
+  design_system_key:
+    file: ./secrets/design_system_key

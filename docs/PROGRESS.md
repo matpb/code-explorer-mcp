@@ -6,16 +6,16 @@ Checklist for the v1 build. Kept current so a restart loses nothing. Spec: the o
 - [x] Repo created, `main` branch, Cargo.toml with pinned dependency majors
 - [x] docs/DECISIONS.md with the open-question answers
 - [x] docs/ARCHITECTURE.md (module contract for the build)
-- [ ] First commit
+- [x] First commit
 
 ## Phase 1: core leaf modules (no HTTP)
-- [ ] `config`: structs, deny_unknown_fields, humantime durations, load, full validation with file and line, warnings
-- [ ] `keys`: keys.toml model, key format, argon2id verify, verify cache, hot reload (notify + SIGHUP), keygen
-- [ ] `paths`: normalization, deny-list (defaults, extra, allow), case-insensitive glob matching
-- [ ] `redact`: Aho-Corasick redactor
-- [ ] `proc`: scrubbed env, process group, timeout kill, worker semaphore, busy
-- [ ] `git`: clone/fetch/worktree/ls-tree/log/show/blame/rev-parse wrappers, askpass, ssh command, stderr scrubbing
-- [ ] Unit tests for each, `cargo clippy -D warnings` clean
+- [x] `config`: structs, deny_unknown_fields, humantime durations, load, full validation with file and line, warnings
+- [x] `keys`: keys.toml model, key format, argon2id verify, verify cache, hot reload (notify + SIGHUP), keygen
+- [x] `paths`: normalization, deny-list (defaults, extra, allow), case-insensitive glob matching
+- [x] `redact`: Aho-Corasick redactor
+- [x] `proc`: scrubbed env, process group, timeout kill, worker semaphore, busy
+- [x] `git`: clone/fetch/worktree/ls-tree/log/show/blame/rev-parse wrappers, askpass, ssh command, stderr scrubbing
+- [x] Unit tests for each, `cargo clippy -D warnings` clean
 
 ## Phase 2: snapshots, scan, auth
 - [ ] `snapshot`: FileIndex from ls-tree, Snapshot, RepoState, Registry, state.json

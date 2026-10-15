@@ -1,0 +1,5 @@
+{$DOMAIN} {
+	reverse_proxy explorer:8080 {
+		flush_interval -1
+	}
+}

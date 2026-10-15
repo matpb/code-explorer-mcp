@@ -412,6 +412,7 @@ dependencies = [
  "predicates",
  "prometheus",
  "rand",
+ "regex",
  "regex-syntax",
  "reqwest",
  "rmcp",

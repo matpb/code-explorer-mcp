@@ -1,0 +1,18 @@
+# keys.toml: hashes only. Written by `code-explorer keygen`; the plaintext key is shown once and never stored.
+# Placeholder hashes below do not verify anything. Generate real entries with keygen.
+
+[[key]]
+id = "k7q2m9xa"
+name = "design-agents"
+hash = "$argon2id$v=19$m=19456,t=2,p=1$UExBQ0VIT0xERVJTQUxU$UExBQ0VIT0xERVJIQVNIUExBQ0VIT0xERVJIQVNI"
+repos = ["web-ui", "design-system"]
+created = "2026-01-01"
+expires = "2027-01-01"
+disabled = false
+
+[[key]]
+id = "p3w8d1rt"
+name = "mobile-team"
+hash = "$argon2id$v=19$m=19456,t=2,p=1$UExBQ0VIT0xERVJTQUxU$UExBQ0VIT0xERVJIQVNIUExBQ0VIT0xERVJIQVNI"
+repos = ["api", "api-next"]
+created = "2026-01-01"
