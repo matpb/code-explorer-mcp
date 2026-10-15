@@ -33,3 +33,5 @@ Answers to the spec's open questions, plus implementation choices made while bui
 - **Remote URL refresh.** The bare repo keeps the clone-time origin URL, so the puller runs `git remote set-url origin` before every fetch and a config change to path, host or credential type takes effect at the next tick.
 - **Clone staging.** A clone lands in `git.clone/` and is renamed to `git/` on success, so a crash mid-clone leaves nothing a later fetch would trip on.
 - **state.json trust.** On restore, a worktree path outside `snapshots/` or containing `..` is rejected. Stored findings go through the allowlist again, and a repo under the block policy is rescanned.
+- **SSH first.** The owner's repos are reached over git SSH only. SSH deploy keys (GitHub) and repository access keys (Bitbucket) are the documented default in the example config, the compose secrets and the onboarding steps. HTTPS tokens stay supported as the second option because the project is generic.
+- **Public repos.** A repo entry may omit `credential` for anonymous HTTPS access to a public repo. SSH always needs a key.
