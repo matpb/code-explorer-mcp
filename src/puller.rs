@@ -384,6 +384,7 @@ async fn pull_inner(deps: &PullerDeps, state: &Arc<RepoState>) -> Result<PullOut
     let depth = deps.config.pull.depth;
 
     if dirs.git.join("HEAD").exists() {
+        clear_stale_locks(&dirs.git, &cfg.id).await;
         point_origin_at(deps, &dirs.git, &url).await?;
         deps.git
             .fetch(&dirs.git, &cfg.branch, depth, cred)
@@ -435,6 +436,56 @@ async fn pull_inner(deps: &PullerDeps, state: &Arc<RepoState>) -> Result<PullOut
         prev.mark_remove_on_drop();
     }
     Ok(PullOutcome::Updated(tip))
+}
+
+/// Pulls are serialized per repo and the puller is the only git writer, so any lock found here is stale.
+async fn clear_stale_locks(git_dir: &Path, repo_id: &str) {
+    const TOP_LEVEL: [&str; 5] = [
+        "config.lock",
+        "shallow.lock",
+        "packed-refs.lock",
+        "FETCH_HEAD.lock",
+        "HEAD.lock",
+    ];
+
+    fn collect_ref_locks(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => collect_ref_locks(&path, out),
+                Ok(t) if t.is_file() && path.extension().is_some_and(|e| e == "lock") => {
+                    out.push(path)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let dir = git_dir.to_path_buf();
+    let repo = repo_id.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut candidates: Vec<PathBuf> = TOP_LEVEL.iter().map(|n| dir.join(n)).collect();
+        collect_ref_locks(&dir.join("refs"), &mut candidates);
+        for path in candidates {
+            let rel = path.strip_prefix(&dir).unwrap_or(&path).display().to_string();
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::warn!(event = "stale_lock_removed", repo = %repo, path = %rel)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(repo = %repo, path = %rel, error = %e, "could not remove stale lock")
+                }
+            }
+        }
+    })
+    .await;
+    if let Err(e) = result {
+        tracing::warn!(repo = %repo_id, error = %e, "stale lock cleanup failed");
+    }
 }
 
 /// Keeps `remote.origin.url` in step with the config, which can change between runs.
@@ -1045,6 +1096,39 @@ mod tests {
         assert!(!old_root.exists(), "old worktree removed once released");
         assert!(second.root.exists());
         assert_eq!(fx.worktrees(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_config_lock_is_cleared_before_pull() {
+        let fx = fixture();
+        pull_once(&fx.deps, &fx.state).await.unwrap();
+        let git_dir = fx.dirs().git;
+        let config_lock = git_dir.join("config.lock");
+        let ref_lock = git_dir.join("refs/heads/zzz.lock");
+        std::fs::write(&config_lock, "").unwrap();
+        std::fs::create_dir_all(ref_lock.parent().unwrap()).unwrap();
+        std::fs::write(&ref_lock, "").unwrap();
+
+        commit(&fx.src, "docs/guide.md", "guide\n", "add guide");
+        let tip = head(&fx.src);
+        assert_eq!(
+            pull_once(&fx.deps, &fx.state).await.unwrap(),
+            PullOutcome::Updated(tip)
+        );
+        assert!(!config_lock.exists());
+        assert!(!ref_lock.exists());
+    }
+
+    #[tokio::test]
+    async fn stale_lock_cleanup_leaves_objects_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path();
+        std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+        std::fs::write(git_dir.join("objects/foo.lock"), "").unwrap();
+        std::fs::write(git_dir.join("shallow.lock"), "").unwrap();
+        clear_stale_locks(git_dir, "a").await;
+        assert!(git_dir.join("objects/foo.lock").exists());
+        assert!(!git_dir.join("shallow.lock").exists());
     }
 
     #[tokio::test]

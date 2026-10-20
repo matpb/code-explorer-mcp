@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows Keep
 
 ## Unreleased
 
+### Fixed
+- The puller removes stale git lock files (`config.lock`, `shallow.lock`, `packed-refs.lock`, `FETCH_HEAD.lock`, `HEAD.lock` and `*.lock` under `refs/`) before each pull. A git process killed by the subprocess timeout could leave one behind and block every later pull of that repo with `could not lock config file`.
+
 ### Added
 - Six read-only MCP tools over local shallow clones: `list_repos`, `list_tree`, `glob`, `read_file`, `grep`, `log`. Optional `blame` and `read_file.commit` behind feature flags.
 - Streamable HTTP transport, MCP 2026-07-28 stateless, with legacy clients served without sessions.
