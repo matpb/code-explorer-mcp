@@ -513,18 +513,39 @@ pub struct Mcp {
 
 impl Mcp {
     pub async fn connect(port: u16, key: &str) -> Mcp {
-        let transport = StreamableHttpClientTransport::from_config(
-            StreamableHttpClientTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp"))
+        const ATTEMPTS: u32 = 30;
+        for attempt in 1..=ATTEMPTS {
+            let transport = StreamableHttpClientTransport::from_config(
+                StreamableHttpClientTransportConfig::with_uri(format!(
+                    "http://127.0.0.1:{port}/mcp"
+                ))
                 .auth_header(key),
-        );
-        let svc = ClientConfig::default()
-            .serve(transport)
-            .await
-            .expect("mcp initialize");
-        Mcp {
-            svc,
-            keep_busy: false,
+            );
+            match ClientConfig::default().serve(transport).await {
+                Ok(svc) => {
+                    return Mcp {
+                        svc,
+                        keep_busy: false,
+                    };
+                }
+                Err(e) => {
+                    // The 503 status and Retry-After appear only in the Debug form of the error.
+                    let text = format!("{e:?}");
+                    if attempt == ATTEMPTS || !text.contains("status: 503") {
+                        panic!("mcp initialize: {e}");
+                    }
+                    let secs = text
+                        .split("retry_after: Some(\"")
+                        .nth(1)
+                        .and_then(|rest| rest.split('"').next())
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .unwrap_or(1);
+                    eprintln!("initialize busy, attempt {attempt}, retrying in {secs}s");
+                    tokio::time::sleep(Duration::from_secs(secs.min(5))).await;
+                }
+            }
         }
+        unreachable!("the last attempt panics")
     }
 
     pub async fn tools(&self) -> Vec<Value> {

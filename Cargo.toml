@@ -16,7 +16,7 @@ name = "code-explorer"
 path = "src/main.rs"
 
 [dependencies]
-rmcp = { version = "3.5", features = ["server", "macros", "transport-streamable-http-server"] }
+rmcp = { version = "3.9", features = ["server", "macros", "transport-streamable-http-server"] }
 schemars = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
@@ -60,7 +60,7 @@ futures = "0.3"
 bytes = "1"
 
 [dev-dependencies]
-rmcp = { version = "3.5", features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
+rmcp = { version = "3.9", features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"

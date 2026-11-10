@@ -14,7 +14,7 @@ This codebase is yours: what it's for and how it's built are your call, and you'
 ## Commands
 - Build and run: `cargo run -q -- --version`; the server is `code-explorer --config ./config.toml serve` and needs `git`, `rg` and `gitleaks` on `PATH`.
 - Full suite: `cargo test --all-targets`. One integration test: `cargo test --test mcp permalink` (substring match on the test name).
-- MCP suite when the host is busy: `cargo test --test mcp -- --test-threads=1`. In parallel, each test spawns servers that clone fixtures; on a loaded machine they miss the 30 s readiness window or fail `mcp initialize` and random tests fail.
+- MCP suite on a heavily loaded host: `cargo test --test mcp -- --test-threads=1`. In parallel, tests spawn servers that clone fixtures and can miss the 30 s readiness window. The test client already retries the server's 503 busy answer on initialize, so a 503 in a failure means a real regression.
 - Format and lint: `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`.
 - Everything, as a release gate: `scripts/check.sh` (fmt, clippy, tests, `cargo audit`, `cargo deny`, gitleaks over the tree and the full history). It installs `cargo-audit` and `cargo-deny` if missing.
 - Docker and both compose profiles: README, "Quick start" and "Deployment". Not covered by the test suite.

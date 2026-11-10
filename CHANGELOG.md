@@ -4,6 +4,9 @@ All notable changes to this project are documented here. The format follows Keep
 
 ## Unreleased
 
+### Security
+- Dependencies updated for RUSTSEC-2026-0457, 0461 and 0462 (`rmcp` 3.9.0), 0385 (`ctutils`), 0382 (`rustls-webpki`) and 0383 (`webpki-root-certs`). `cargo audit` is clean again.
+
 ### Fixed
 - The puller removes stale git lock files (`config.lock`, `shallow.lock`, `packed-refs.lock`, `FETCH_HEAD.lock`, `HEAD.lock` and `*.lock` under `refs/`) before each pull. A git process killed by the subprocess timeout could leave one behind and block every later pull of that repo with `could not lock config file`.
 

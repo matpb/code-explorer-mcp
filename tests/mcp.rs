@@ -99,6 +99,30 @@ async fn post(
     req.send().await.expect("request sent")
 }
 
+/// Re-sends `body` while the server answers 503 busy, sleeping Retry-After (default 1s, cap 5s).
+async fn post_until_not_busy(
+    http: &reqwest::Client,
+    url: &str,
+    key: Option<&str>,
+    extra: &[(&str, &str)],
+    body: String,
+) -> reqwest::Response {
+    for _ in 0..29 {
+        let resp = post(http, url, key, extra, body.clone()).await;
+        if resp.status() != 503 {
+            return resp;
+        }
+        let secs = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1);
+        tokio::time::sleep(Duration::from_secs(secs.min(5))).await;
+    }
+    post(http, url, key, extra, body).await
+}
+
 fn list_repos_call() -> String {
     rpc(
         2,
@@ -191,7 +215,7 @@ async fn legacy_client_works_without_session_header() {
         "initialize",
         json!({"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "legacy", "version": "1"}}),
     );
-    let resp = post(&http, &s.mcp_url(), Some(s.full_key()), &[], init).await;
+    let resp = post_until_not_busy(&http, &s.mcp_url(), Some(s.full_key()), &[], init).await;
     assert_eq!(resp.status(), 200);
     let body = rpc_json(&resp.text().await.expect("body"));
     assert_eq!(body["result"]["serverInfo"]["name"], "code-explorer");
