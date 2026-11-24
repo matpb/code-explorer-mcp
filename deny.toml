@@ -4,6 +4,10 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no vulnerability; rmcp and schemars depend on it" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime unmaintained, no vulnerability; only parses and formats config durations" },
+]
 
 [licenses]
 version = 2

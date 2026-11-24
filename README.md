@@ -15,7 +15,7 @@ A read-only [MCP](https://modelcontextprotocol.io) server that lets AI agents ex
 | `list_repos` | The repos this key may see, with description, branch, commit, freshness and status. `secrets_redacted` counts the values masked in served content (0 unless the `redact` policy applies) and `secret_findings` counts what the scanner found under any policy. |
 | `list_tree` | Directory listing from a path, breadth-first to a depth, from the in-memory index. |
 | `glob` | Find files by gitignore-style pattern (`src/**/*.tsx`). |
-| `read_file` | Exact text of a line range, with a permalink to the host at that commit. |
+| `read_file` | Text of a line range (detected secrets redacted), with a permalink to the host at that commit. |
 | `grep` | ripgrep across one or many repos: regex or literal, globs, file types, context lines. Each match carries `before` and `after` arrays of `{line, text}` objects; a neighboring match is context of the match next to it. A repo that cannot get a worker slot is listed in `repos_skipped` with reason `busy`. |
 | `log` | Recent commits, optionally for one path, with changed files. |
 | `blame` | Optional, off by default. Line attribution within the kept history. |
@@ -130,7 +130,7 @@ Authenticated traffic is never rate limited. A global worker cap bounds subproce
 | `logging.author_emails` | `false` | `log` returns author names only unless true. |
 | `metrics.enabled` | `true` | Prometheus text on the admin listener. |
 
-Built-in deny-list: `.git/**`, `**/.env`, `**/.env.*`, `**/*.pem`, `**/*.key`, `**/*.p12`, `**/*.pfx`, `**/*.jks`, `**/*.keystore`, `**/id_rsa*`, `**/id_ed25519*`, `**/.npmrc`, `**/.pypirc`, `**/.netrc`, `**/*.tfstate`, `**/*.tfstate.*`, `**/credentials*.json`, `**/secrets.*`, `**/id_ecdsa*`, `**/id_dsa*`, `**/*.p8`, `**/.htpasswd`, `**/.git-credentials`, `**/.docker/config.json`, `**/kubeconfig*`, `**/*.kdbx`, `**/*.gpg`, `**/service-account*.json`. Templates such as `.env.example` are denied too; carve exceptions with `deny.allow`.
+Built-in deny-list: `.git/**`, `**/.env`, `**/.env.*`, `**/*.pem`, `**/*.key`, `**/*.p12`, `**/*.pfx`, `**/*.jks`, `**/*.keystore`, `**/id_rsa*`, `**/id_ed25519*`, `**/.npmrc`, `**/.pypirc`, `**/.netrc`, `**/*.tfstate`, `**/*.tfstate.*`, `**/credentials*.json`, `**/secrets.*`, `**/id_ecdsa*`, `**/id_dsa*`, `**/*.p8`, `**/.htpasswd`, `**/.git-credentials`, `**/.docker/config.json`, `**/kubeconfig*`, `**/*.kdbx`, `**/*.gpg`, `**/service-account*.json`, `**/.aws/credentials`, `**/.pgpass`, `**/*.tfvars`. Templates such as `.env.example` are denied too; carve exceptions with `deny.allow`.
 
 ### Credentials and repos
 

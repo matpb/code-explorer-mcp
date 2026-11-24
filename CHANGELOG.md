@@ -4,7 +4,14 @@ All notable changes to this project are documented here. The format follows Keep
 
 ## Unreleased
 
+### Changed
+- `rmcp` 3.9 to 3.11. Since 3.11 the server answers methods it does not advertise (`resources/*`, `prompts/*`) with "method not found" instead of empty lists. Tool names and schemas are unchanged.
+- `lru` 0.19, `nix` 0.32, and all other dependencies updated within semver.
+- The `read_file` tool description now says detected secrets are redacted, instead of promising the exact content.
+
 ### Security
+- The built-in deny-list also covers `**/.aws/credentials`, `**/.pgpass` and `**/*.tfvars`.
+- `cargo deny` ignores RUSTSEC-2026-0542 (`humantime`) and RUSTSEC-2026-0543 (`chrono`): both are unmaintained notices with no vulnerability.
 - Dependencies updated for RUSTSEC-2026-0457, 0461 and 0462 (`rmcp` 3.9.0), 0385 (`ctutils`), 0382 (`rustls-webpki`) and 0383 (`webpki-root-certs`). `cargo audit` is clean again.
 
 ### Fixed

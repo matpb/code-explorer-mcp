@@ -36,6 +36,9 @@ pub const DEFAULT_DENY: &[&str] = &[
     "**/*.kdbx",
     "**/*.gpg",
     "**/service-account*.json",
+    "**/.aws/credentials",
+    "**/.pgpass",
+    "**/*.tfvars",
 ];
 
 /// Why a client-supplied path was rejected.
@@ -371,6 +374,9 @@ mod tests {
             "backup/secrets.GPG",
             "gcp/service-account.json",
             "gcp/service-account-prod.json",
+            "deploy/.aws/credentials",
+            ".pgpass",
+            "infra/prod.tfvars",
         ] {
             assert!(
                 d.is_denied(&p_unchecked(denied)),

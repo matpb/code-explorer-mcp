@@ -118,7 +118,7 @@ fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             name: "read_file",
             title: "Read a file",
-            description: "Read a text file by line range. Returns the exact content with line numbers in the text rendering, the total line count and a permalink at the commit. Long lines are cut; binary and very large files are refused.",
+            description: "Read a text file by line range. Returns the content (detected secrets are redacted) with line numbers in the text rendering, the total line count and a permalink at the commit. Long lines are cut; binary and very large files are refused.",
             input: input_schema::<read_file::Params>,
             output: output_schema::<read_file::Output>,
         },
